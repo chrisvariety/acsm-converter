@@ -1,0 +1,14 @@
+# ignore binaries
+bin/
+adobe/
+Adobe-Digital-Editions/
+.adobe-digital-editions/
+.adept/
+
+# ignore data files
+*.acsm
+*.pdf
+*.epub
+*.drm
+.DS_Store
+node_modules

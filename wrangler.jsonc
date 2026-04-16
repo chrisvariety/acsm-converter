@@ -1,0 +1,32 @@
+{
+  "name": "acsm-converter",
+  "main": "src/index.js",
+  "compatibility_date": "2026-04-16",
+  "containers": [
+    {
+      "class_name": "MyContainer",
+      "image": "./Dockerfile",
+      "max_instances": 5
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "MyContainer",
+        "name": "MY_CONTAINER"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "new_sqlite_classes": ["MyContainer"],
+      "tag": "v1"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "www.acsm-converter.com",
+      "custom_domain": true
+    }
+  ]
+}
