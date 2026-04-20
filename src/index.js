@@ -2,7 +2,6 @@ import { Container, getContainer } from "@cloudflare/containers";
 
 export class MyContainer extends Container {
   defaultPort = 8080;
-  sleepAfter = "1h";
 }
 
 const HTML = `<!DOCTYPE html>
