@@ -6,27 +6,33 @@
     {
       "class_name": "MyContainer",
       "image": "./Dockerfile",
-      "max_instances": 5
-    }
+      "max_instances": 1,
+    },
   ],
   "durable_objects": {
     "bindings": [
       {
         "class_name": "MyContainer",
-        "name": "MY_CONTAINER"
-      }
-    ]
+        "name": "MY_CONTAINER",
+      },
+    ],
   },
   "migrations": [
     {
       "new_sqlite_classes": ["MyContainer"],
-      "tag": "v1"
-    }
+      "tag": "v1",
+    },
   ],
   "routes": [
     {
       "pattern": "www.acsm-converter.com",
-      "custom_domain": true
-    }
-  ]
+      "custom_domain": true,
+    },
+  ],
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": false,
+    },
+  },
 }
