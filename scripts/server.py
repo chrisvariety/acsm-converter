@@ -151,12 +151,11 @@ class ConvertHandler(BaseHTTPRequestHandler):
             return
 
         body = self.rfile.read(content_length)
-        filename = self.headers.get("X-Filename", "input.acsm")
-        print(f"[convert] Received {filename} ({content_length} bytes)", flush=True)
+        print(f"[convert] Received {content_length} bytes", flush=True)
 
         work_dir = tempfile.mkdtemp(dir=WORK_DIR)
         try:
-            acsm_path = os.path.join(work_dir, filename)
+            acsm_path = os.path.join(work_dir, "input.acsm")
             with open(acsm_path, "wb") as f:
                 f.write(body)
 

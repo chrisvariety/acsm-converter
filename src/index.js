@@ -95,7 +95,6 @@ const HTML = `<!DOCTYPE html>
       try {
         const resp = await fetch("/convert", {
           method: "POST",
-          headers: { "X-Filename": file.name },
           body: await file.arrayBuffer(),
         });
         if (!resp.ok) {
@@ -125,7 +124,7 @@ const HTML = `<!DOCTYPE html>
         status.textContent = "Done! Your file is downloading.";
         status.className = "";
       } catch (err) {
-        showPlainError(err.message);
+        showPlainError(err.name + ": " + err.message);
       }
     });
 
@@ -172,7 +171,6 @@ export default {
     }
 
     if (url.pathname === "/convert" && request.method === "POST") {
-      const filename = request.headers.get("X-Filename") || "input.acsm";
       const body = await request.arrayBuffer();
 
       if (!body.byteLength) {
@@ -182,10 +180,7 @@ export default {
       const container = getContainer(env.MY_CONTAINER, "default");
       return container.fetch("http://container/convert", {
         method: "POST",
-        headers: {
-          "X-Filename": filename,
-          "Content-Type": "application/octet-stream",
-        },
+        headers: { "Content-Type": "application/octet-stream" },
         body,
       });
     }
