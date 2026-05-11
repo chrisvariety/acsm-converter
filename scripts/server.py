@@ -12,6 +12,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 ADEPT_DIR = "/home/libgourou/.adept"
 WORK_DIR = "/home/libgourou/work"
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
 
 CRED_FILES = ("device.xml", "activation.xml", "devicesalt")
 CRED_HEADERS = {
@@ -177,6 +178,12 @@ class ConvertHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
+
+        if AUTH_TOKEN:
+            auth = self.headers.get("Authorization", "")
+            if auth != f"Bearer {AUTH_TOKEN}":
+                self._json_response(401, {"error": "Unauthorized"})
+                return
 
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:

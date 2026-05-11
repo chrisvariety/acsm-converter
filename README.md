@@ -16,6 +16,7 @@ src/index.js       # Cloudflare Worker — serves the UI and proxies to the cont
 scripts/server.py  # Python HTTP server running inside the container
 Dockerfile         # Builds libgourou tools + the HTTP server
 wrangler.jsonc     # Cloudflare Workers/Containers configuration
+fly.toml           # Fly.io configuration (alternate backend, optional)
 ```
 
 ## Development
@@ -32,6 +33,49 @@ npm run deploy
 ```
 
 The app is configured to serve on `www.acsm-converter.com` via a custom domain in `wrangler.jsonc`.
+
+## Fly.io backend (alternate)
+
+The same container can also run on Fly.io. This is useful when Cloudflare Containers' shared egress IPs hit rate limits from content providers (e.g. Google Play's `acs4_book_bytes` endpoint).
+
+### Deploy to Fly.io
+
+```bash
+flyctl launch --no-deploy   # accept the existing fly.toml; pick an app name + region
+flyctl secrets set AUTH_TOKEN=$(openssl rand -hex 32)
+flyctl deploy
+```
+
+Note the public URL of the deployed app (e.g. `https://your-app.fly.dev`) and the `AUTH_TOKEN` value you set.
+
+### Point the Worker at Fly.io
+
+Store the same token as a Worker secret (one-time):
+
+```bash
+npx wrangler secret put FLY_AUTH_TOKEN   # paste the same value used for AUTH_TOKEN above
+```
+
+Then in `src/index.js`, swap the container call:
+
+```js
+// Cloudflare Containers (default):
+const container = getContainer(env.MY_CONTAINER, "default");
+const upstream = await container.fetch("http://container/convert", {
+  method: "POST",
+  headers: containerHeaders,
+  body,
+});
+
+// Fly.io:
+const upstream = await fetch("https://your-app.fly.dev/convert", {
+  method: "POST",
+  headers: { ...containerHeaders, Authorization: `Bearer ${env.FLY_AUTH_TOKEN}` },
+  body,
+});
+```
+
+Then `npm run deploy` (or `npm run dev`) to use Fly.io. Swap back to the container fetch to return to Cloudflare Containers.
 
 ## Known error codes
 

@@ -215,12 +215,17 @@ export default {
         }
       }
 
-      const container = getContainer(env.MY_CONTAINER, "default");
-      const upstream = await container.fetch("http://container/convert", {
+      const upstream = await fetch("https://acsm-converter-fly.fly.dev/convert", {
         method: "POST",
-        headers: containerHeaders,
+        headers: { ...containerHeaders, Authorization: `Bearer ${env.FLY_AUTH_TOKEN}` },
         body,
       });
+      // const container = getContainer(env.MY_CONTAINER, "default");
+      // const upstream = await container.fetch("http://container/convert", {
+      //   method: "POST",
+      //   headers: containerHeaders,
+      //   body,
+      // });
 
       const freshDevice = upstream.headers.get("X-Adept-Device-Xml");
       const freshActivation = upstream.headers.get("X-Adept-Activation-Xml");
