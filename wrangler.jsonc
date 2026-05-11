@@ -23,6 +23,14 @@
       "tag": "v1",
     },
   ],
+  "d1_databases": [
+    {
+      "binding": "ADEPT_DB",
+      "database_name": "acsm-converter",
+      "database_id": "40318abc-4c54-4bde-ae36-9aa0cc3f5029",
+      "migrations_dir": "migrations",
+    },
+  ],
   "routes": [
     {
       "pattern": "www.acsm-converter.com",

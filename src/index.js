@@ -4,6 +4,30 @@ export class MyContainer extends Container {
   defaultPort = 8080;
 }
 
+function extractAdeptId(acsmBytes) {
+  const text = new TextDecoder().decode(acsmBytes);
+  const match = text.match(/<userId>([^<]+)<\/userId>/);
+  return match ? match[1].trim() : null;
+}
+
+function bytesToBase64(value) {
+  const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : value;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -177,11 +201,51 @@ export default {
         return Response.json({ error: "No file uploaded" }, { status: 400 });
       }
 
+      const id = extractAdeptId(body);
+
+      const containerHeaders = { "Content-Type": "application/octet-stream" };
+      if (id) {
+        const cached = await env.ADEPT_DB.prepare(
+          "SELECT device_xml, activation_xml, devicesalt FROM adept_credentials WHERE id = ?"
+        ).bind(id).first();
+        if (cached) {
+          containerHeaders["X-Adept-Device-Xml"] = bytesToBase64(cached.device_xml);
+          containerHeaders["X-Adept-Activation-Xml"] = bytesToBase64(cached.activation_xml);
+          containerHeaders["X-Adept-Device-Salt"] = bytesToBase64(cached.devicesalt);
+        }
+      }
+
       const container = getContainer(env.MY_CONTAINER, "default");
-      return container.fetch("http://container/convert", {
+      const upstream = await container.fetch("http://container/convert", {
         method: "POST",
-        headers: { "Content-Type": "application/octet-stream" },
+        headers: containerHeaders,
         body,
+      });
+
+      const freshDevice = upstream.headers.get("X-Adept-Device-Xml");
+      const freshActivation = upstream.headers.get("X-Adept-Activation-Xml");
+      const freshSalt = upstream.headers.get("X-Adept-Device-Salt");
+      if (id && freshDevice && freshActivation && freshSalt) {
+        await env.ADEPT_DB.prepare(
+          "INSERT OR IGNORE INTO adept_credentials (id, device_xml, activation_xml, devicesalt, created_at) VALUES (?, ?, ?, ?, ?)"
+        ).bind(
+          id,
+          base64ToBytes(freshDevice),
+          base64ToBytes(freshActivation),
+          base64ToBytes(freshSalt),
+          Math.floor(Date.now() / 1000)
+        ).run();
+      }
+
+      const responseHeaders = new Headers(upstream.headers);
+      responseHeaders.delete("X-Adept-Device-Xml");
+      responseHeaders.delete("X-Adept-Activation-Xml");
+      responseHeaders.delete("X-Adept-Device-Salt");
+
+      return new Response(upstream.body, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: responseHeaders,
       });
     }
 

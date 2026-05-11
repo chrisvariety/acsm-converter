@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """HTTP server for ACSM-to-EPUB/PDF conversion using libgourou tools."""
 
+import base64
 import json
 import os
 import re
@@ -11,6 +12,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 ADEPT_DIR = "/home/libgourou/.adept"
 WORK_DIR = "/home/libgourou/work"
+
+CRED_FILES = ("device.xml", "activation.xml", "devicesalt")
+CRED_HEADERS = {
+    "device.xml": "X-Adept-Device-Xml",
+    "activation.xml": "X-Adept-Activation-Xml",
+    "devicesalt": "X-Adept-Device-Salt",
+}
 
 # Known ADEPT error codes and user-friendly guidance
 KNOWN_ERRORS = {
@@ -120,6 +128,31 @@ KNOWN_ERRORS = {
             },
         ],
     },
+    "HTTP Error code 429": {
+        "title": "Rate limited by the content provider",
+        "description": (
+            "The content provider returned HTTP 429 (Too Many Requests). This is "
+            "usually a short-lived rate limit applied to the server's IP address "
+            "or to the specific book you're trying to download."
+        ),
+        "solutions": [
+            {
+                "heading": "Wait and try again",
+                "text": (
+                    "Rate limits typically clear in a few minutes. Wait 5-15 "
+                    "minutes and try converting again."
+                ),
+            },
+            {
+                "heading": "Try a fresh ACSM file",
+                "text": (
+                    "If retrying doesn't help, download a new ACSM file from your "
+                    "content provider -- the specific file may have hit a per-book "
+                    "download limit."
+                ),
+            },
+        ],
+    },
 }
 
 
@@ -154,21 +187,35 @@ class ConvertHandler(BaseHTTPRequestHandler):
         print(f"[convert] Received {content_length} bytes", flush=True)
 
         work_dir = tempfile.mkdtemp(dir=WORK_DIR)
+        fresh_creds = None
         try:
             acsm_path = os.path.join(work_dir, "input.acsm")
             with open(acsm_path, "wb") as f:
                 f.write(body)
 
-            # Activate anonymous credentials if not already present
-            if not os.path.exists(os.path.join(ADEPT_DIR, "device.xml")):
-                # --output-dir requires the directory to not exist yet
-                if os.path.exists(ADEPT_DIR):
-                    shutil.rmtree(ADEPT_DIR)
+            # The Worker owns credential lifecycle; wipe any cached state per request.
+            if os.path.exists(ADEPT_DIR):
+                shutil.rmtree(ADEPT_DIR)
+
+            provided = {
+                name: self.headers.get(header)
+                for name, header in CRED_HEADERS.items()
+            }
+            if all(provided.values()):
+                print("[convert] Hydrating credentials from request headers", flush=True)
+                os.makedirs(ADEPT_DIR, exist_ok=True)
+                for name, b64 in provided.items():
+                    with open(os.path.join(ADEPT_DIR, name), "wb") as f:
+                        f.write(base64.b64decode(b64))
+            else:
                 print("[convert] Running adept_activate --anonymous", flush=True)
                 self._run(["adept_activate", "--anonymous", "--output-dir", ADEPT_DIR])
                 print("[convert] Activation complete", flush=True)
-            else:
-                print("[convert] Credentials already exist, skipping activation", flush=True)
+                # Snapshot creds now so they survive a later subprocess failure.
+                fresh_creds = {}
+                for name in CRED_FILES:
+                    with open(os.path.join(ADEPT_DIR, name), "rb") as f:
+                        fresh_creds[CRED_HEADERS[name]] = base64.b64encode(f.read()).decode()
 
             # Download the encrypted file from the ACSM link
             print("[convert] Running acsmdownloader", flush=True)
@@ -180,7 +227,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
             print(f"[convert] acsmdownloader stderr: {result.stderr}", flush=True)
 
             # Parse output to find the downloaded filename.
-            # acsmdownloader outputs lines like "Created Dire Bound.epub"
+            # acsmdownloader outputs lines like "Created File Name.epub"
             # where the first word is a status prefix — match the original
             # entrypoint.sh approach: grep for epub/pdf, drop the first word.
             output_filename = None
@@ -199,7 +246,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
                     "error": "Could not determine output filename",
                     "stdout": result.stdout,
                     "stderr": result.stderr,
-                })
+                }, extra_headers=fresh_creds)
                 return
 
             print(f"[convert] Output file: {output_filename}", flush=True)
@@ -228,6 +275,8 @@ class ConvertHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Disposition", f'attachment; filename="{output_filename}"')
             self.send_header("Content-Length", str(len(data)))
+            for header, value in (fresh_creds or {}).items():
+                self.send_header(header, value)
             self.end_headers()
             self.wfile.write(data)
 
@@ -243,24 +292,26 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 self._json_response(400, {
                     "error_code": error_code,
                     **known,
-                })
+                }, extra_headers=fresh_creds)
             else:
                 self._json_response(500, {
                     "error": f"Command failed: {e.cmd}",
                     "stdout": e.stdout or "",
                     "stderr": e.stderr or "",
-                })
+                }, extra_headers=fresh_creds)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
     def _run(self, cmd, **kwargs):
         return subprocess.run(cmd, check=True, capture_output=True, text=True, **kwargs)
 
-    def _json_response(self, status, body):
+    def _json_response(self, status, body, extra_headers=None):
         data = json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        for header, value in (extra_headers or {}).items():
+            self.send_header(header, value)
         self.end_headers()
         self.wfile.write(data)
 
