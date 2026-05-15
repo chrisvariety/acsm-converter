@@ -8,7 +8,10 @@ import re
 import shutil
 import subprocess
 import tempfile
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+_convert_lock = threading.Lock()
 
 ADEPT_DIR = "/home/libgourou/.adept"
 WORK_DIR = "/home/libgourou/work"
@@ -193,14 +196,37 @@ class ConvertHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length)
         print(f"[convert] Received {content_length} bytes", flush=True)
 
+        # Start NDJSON streaming response. After this point, errors are
+        # reported as {"type":"error",...} events, not via HTTP status.
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        try:
+            self._send_event({"type": "queued"})
+            waited = 0
+            while not _convert_lock.acquire(timeout=10):
+                waited += 10
+                self._send_event({"type": "waiting", "seconds_waited": waited})
+        except (BrokenPipeError, ConnectionResetError):
+            print("[convert] Client disconnected while queued", flush=True)
+            return
+
+        try:
+            self._do_convert(body)
+        except (BrokenPipeError, ConnectionResetError):
+            print("[convert] Client disconnected during conversion", flush=True)
+        finally:
+            _convert_lock.release()
+
+    def _do_convert(self, body):
         work_dir = tempfile.mkdtemp(dir=WORK_DIR)
-        fresh_creds = None
         try:
             acsm_path = os.path.join(work_dir, "input.acsm")
             with open(acsm_path, "wb") as f:
                 f.write(body)
 
-            # The Worker owns credential lifecycle; wipe any cached state per request.
             if os.path.exists(ADEPT_DIR):
                 shutil.rmtree(ADEPT_DIR)
 
@@ -209,59 +235,54 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 for name, header in CRED_HEADERS.items()
             }
             if all(provided.values()):
-                print("[convert] Hydrating credentials from request headers", flush=True)
+                self._send_event({"type": "status", "stage": "hydrate",
+                                  "message": "Hydrating credentials from request headers"})
                 os.makedirs(ADEPT_DIR, exist_ok=True)
                 for name, b64 in provided.items():
                     with open(os.path.join(ADEPT_DIR, name), "wb") as f:
                         f.write(base64.b64decode(b64))
             else:
-                print("[convert] Running adept_activate --anonymous", flush=True)
+                self._send_event({"type": "status", "stage": "activate",
+                                  "message": "Activating anonymous Adept account"})
                 self._run(["adept_activate", "--anonymous", "--output-dir", ADEPT_DIR])
-                print("[convert] Activation complete", flush=True)
-                # Snapshot creds now so they survive a later subprocess failure.
-                fresh_creds = {}
+                # Emit fresh creds immediately so the Worker can persist them
+                # even if the rest of the request fails.
+                creds_event = {"type": "credentials"}
                 for name in CRED_FILES:
                     with open(os.path.join(ADEPT_DIR, name), "rb") as f:
-                        fresh_creds[CRED_HEADERS[name]] = base64.b64encode(f.read()).decode()
+                        creds_event[CRED_HEADERS[name]] = base64.b64encode(f.read()).decode()
+                self._send_event(creds_event)
 
-            # Download the encrypted file from the ACSM link
-            print("[convert] Running acsmdownloader", flush=True)
+            self._send_event({"type": "status", "stage": "download",
+                              "message": "Downloading encrypted file"})
             result = self._run(
                 ["acsmdownloader", "--adept-directory", ADEPT_DIR, acsm_path],
                 cwd=work_dir,
             )
-            print(f"[convert] acsmdownloader stdout: {result.stdout}", flush=True)
-            print(f"[convert] acsmdownloader stderr: {result.stderr}", flush=True)
 
-            # Parse output to find the downloaded filename.
-            # acsmdownloader outputs lines like "Created File Name.epub"
-            # where the first word is a status prefix — match the original
-            # entrypoint.sh approach: grep for epub/pdf, drop the first word.
+            # acsmdownloader prints lines like "Created File Name.epub" — first
+            # token is a status prefix, remainder is the filename.
             output_filename = None
             for line in (result.stdout + result.stderr).splitlines():
                 if re.search(r"\.(epub|pdf)\b", line, re.IGNORECASE):
                     parts = line.strip().split(" ", 1)
-                    if len(parts) == 2:
-                        output_filename = parts[1].strip()
-                    else:
-                        output_filename = parts[0].strip()
+                    output_filename = parts[1].strip() if len(parts) == 2 else parts[0].strip()
                     break
 
             if not output_filename:
-                print(f"[convert] ERROR: Could not determine output filename", flush=True)
-                self._json_response(500, {
+                self._send_event({
+                    "type": "error",
                     "error": "Could not determine output filename",
                     "stdout": result.stdout,
                     "stderr": result.stderr,
-                }, extra_headers=fresh_creds)
+                })
                 return
 
-            print(f"[convert] Output file: {output_filename}", flush=True)
             encrypted_path = os.path.join(work_dir, output_filename)
             decrypted_path = os.path.join(work_dir, "decrypted_" + output_filename)
 
-            # Remove DRM
-            print("[convert] Running adept_remove", flush=True)
+            self._send_event({"type": "status", "stage": "decrypt",
+                              "message": "Removing DRM"})
             self._run([
                 "adept_remove",
                 "--adept-directory", ADEPT_DIR,
@@ -269,23 +290,20 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 encrypted_path,
             ])
 
-            # Send the decrypted file back
             with open(decrypted_path, "rb") as f:
                 data = f.read()
 
-            print(f"[convert] Success! Returning {output_filename} ({len(data)} bytes)", flush=True)
             content_type = (
-                "application/epub+zip" if output_filename.endswith(".epub")
+                "application/epub+zip" if output_filename.lower().endswith(".epub")
                 else "application/pdf"
             )
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Disposition", f'attachment; filename="{output_filename}"')
-            self.send_header("Content-Length", str(len(data)))
-            for header, value in (fresh_creds or {}).items():
-                self.send_header(header, value)
-            self.end_headers()
-            self.wfile.write(data)
+            print(f"[convert] Success! Returning {output_filename} ({len(data)} bytes)", flush=True)
+            self._send_event({
+                "type": "result",
+                "filename": output_filename,
+                "content_type": content_type,
+                "data_base64": base64.b64encode(data).decode(),
+            })
 
         except subprocess.CalledProcessError as e:
             output = (e.stdout or "") + (e.stderr or "")
@@ -295,30 +313,30 @@ class ConvertHandler(BaseHTTPRequestHandler):
 
             error_code, known = _match_known_error(output)
             if known:
-                print(f"[convert] Matched known error: {error_code}", flush=True)
-                self._json_response(400, {
-                    "error_code": error_code,
-                    **known,
-                }, extra_headers=fresh_creds)
+                self._send_event({"type": "error", "error_code": error_code, **known})
             else:
-                self._json_response(500, {
+                self._send_event({
+                    "type": "error",
                     "error": f"Command failed: {e.cmd}",
                     "stdout": e.stdout or "",
                     "stderr": e.stderr or "",
-                }, extra_headers=fresh_creds)
+                })
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
     def _run(self, cmd, **kwargs):
         return subprocess.run(cmd, check=True, capture_output=True, text=True, **kwargs)
 
-    def _json_response(self, status, body, extra_headers=None):
+    def _send_event(self, obj):
+        line = json.dumps(obj).encode() + b"\n"
+        self.wfile.write(line)
+        self.wfile.flush()
+
+    def _json_response(self, status, body):
         data = json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
-        for header, value in (extra_headers or {}).items():
-            self.send_header(header, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -326,6 +344,6 @@ class ConvertHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     os.makedirs(WORK_DIR, exist_ok=True)
     os.makedirs(ADEPT_DIR, exist_ok=True)
-    server = HTTPServer(("0.0.0.0", 8080), ConvertHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", 8080), ConvertHandler)
     print("Server listening on port 8080")
     server.serve_forever()

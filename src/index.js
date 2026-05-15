@@ -110,12 +110,19 @@ const HTML = `<!DOCTYPE html>
   <script>
     const form = document.getElementById("form");
     const status = document.getElementById("status");
+
+    const STAGE_LABELS = {
+      hydrate: "Starting...",
+      activate: "Preparing...",
+      download: "Processing file...",
+      decrypt: "Finalizing...",
+    };
+
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const file = form.file.files[0];
       if (!file) return;
-      status.textContent = "Converting... this may take a minute.";
-      status.className = "";
+      setStatus("Uploading...");
       try {
         const resp = await fetch("/convert", {
           method: "POST",
@@ -123,34 +130,89 @@ const HTML = `<!DOCTYPE html>
         });
         if (!resp.ok) {
           const err = await resp.json().catch(() => null);
-          if (err && err.error_code) {
-            showKnownError(err);
-          } else if (err) {
-            const parts = [err.error || "Conversion failed"];
-            if (err.stdout) parts.push("stdout: " + err.stdout);
-            if (err.stderr) parts.push("stderr: " + err.stderr);
-            showPlainError(parts.join("\\n"));
-          } else {
-            showPlainError("Conversion failed: " + resp.statusText);
-          }
+          showPlainError(err && err.error ? err.error : "Conversion failed: " + resp.statusText);
           return;
         }
-        const disposition = resp.headers.get("Content-Disposition") || "";
-        const match = disposition.match(/filename="(.+?)"/);
-        const filename = match ? match[1] : "output.epub";
-        const blob = await resp.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = filename;
-        a.click();
-        URL.revokeObjectURL(url);
-        status.textContent = "Done! Your file is downloading.";
-        status.className = "";
+
+        let resultEvent = null;
+        let errorEvent = null;
+        await readNdjson(resp.body, (event) => {
+          switch (event.type) {
+            case "queued":
+              setStatus("Queued...");
+              break;
+            case "waiting":
+              setStatus("Waiting in queue (" + event.seconds_waited + "s)...");
+              break;
+            case "status":
+              setStatus(STAGE_LABELS[event.stage] || event.message || "Working...");
+              break;
+            case "result":
+              resultEvent = event;
+              break;
+            case "error":
+              errorEvent = event;
+              break;
+          }
+        });
+
+        if (resultEvent) {
+          const bytes = base64ToBytes(resultEvent.data_base64);
+          const blob = new Blob([bytes], { type: resultEvent.content_type });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = resultEvent.filename || "output.epub";
+          a.click();
+          URL.revokeObjectURL(url);
+          setStatus("Done! Your file is downloading.");
+        } else if (errorEvent) {
+          if (errorEvent.error_code) {
+            showKnownError(errorEvent);
+          } else {
+            const parts = [errorEvent.error || "Conversion failed"];
+            if (errorEvent.stdout) parts.push("stdout: " + errorEvent.stdout);
+            if (errorEvent.stderr) parts.push("stderr: " + errorEvent.stderr);
+            showPlainError(parts.join("\\n"));
+          }
+        } else {
+          showPlainError("Conversion ended without a result.");
+        }
       } catch (err) {
         showPlainError(err.name + ": " + err.message);
       }
     });
+
+    async function readNdjson(body, onEvent) {
+      const reader = body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buffer.indexOf("\\n")) >= 0) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (!line) continue;
+          try { onEvent(JSON.parse(line)); } catch (_) {}
+        }
+      }
+    }
+
+    function base64ToBytes(b64) {
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    }
+
+    function setStatus(msg) {
+      status.textContent = msg;
+      status.className = "";
+      status.style.whiteSpace = "";
+    }
 
     function showPlainError(msg) {
       status.innerText = msg;
@@ -185,7 +247,7 @@ const HTML = `<!DOCTYPE html>
 </html>`;
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === "/" && request.method === "GET") {
@@ -220,37 +282,71 @@ export default {
         headers: { ...containerHeaders, Authorization: `Bearer ${env.FLY_AUTH_TOKEN}` },
         body,
       });
-      // const container = getContainer(env.MY_CONTAINER, "default");
-      // const upstream = await container.fetch("http://container/convert", {
-      //   method: "POST",
-      //   headers: containerHeaders,
-      //   body,
-      // });
 
-      const freshDevice = upstream.headers.get("X-Adept-Device-Xml");
-      const freshActivation = upstream.headers.get("X-Adept-Activation-Xml");
-      const freshSalt = upstream.headers.get("X-Adept-Device-Salt");
-      if (id && freshDevice && freshActivation && freshSalt) {
-        await env.ADEPT_DB.prepare(
-          "INSERT OR IGNORE INTO adept_credentials (id, device_xml, activation_xml, devicesalt, created_at) VALUES (?, ?, ?, ?, ?)"
-        ).bind(
-          id,
-          base64ToBytes(freshDevice),
-          base64ToBytes(freshActivation),
-          base64ToBytes(freshSalt),
-          Math.floor(Date.now() / 1000)
-        ).run();
+      // Pre-stream failure (e.g. 401, 400) — surface as-is.
+      if (!upstream.ok) {
+        return new Response(upstream.body, {
+          status: upstream.status,
+          statusText: upstream.statusText,
+          headers: upstream.headers,
+        });
       }
 
-      const responseHeaders = new Headers(upstream.headers);
-      responseHeaders.delete("X-Adept-Device-Xml");
-      responseHeaders.delete("X-Adept-Activation-Xml");
-      responseHeaders.delete("X-Adept-Device-Salt");
+      // Pipe the NDJSON stream to the browser. Intercept "credentials"
+      // events along the way and persist them to D1 via ctx.waitUntil.
+      const { readable, writable } = new TransformStream();
+      const upstreamReader = upstream.body.getReader();
+      const writer = writable.getWriter();
+      const decoder = new TextDecoder();
+      const encoder = new TextEncoder();
 
-      return new Response(upstream.body, {
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers: responseHeaders,
+      const forward = (async () => {
+        let buffer = "";
+        try {
+          while (true) {
+            const { done, value } = await upstreamReader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let idx;
+            while ((idx = buffer.indexOf("\n")) >= 0) {
+              const line = buffer.slice(0, idx);
+              buffer = buffer.slice(idx + 1);
+              if (!line.trim()) continue;
+              let event;
+              try { event = JSON.parse(line); } catch { continue; }
+
+              if (event.type === "credentials") {
+                if (id) {
+                  ctx.waitUntil(
+                    env.ADEPT_DB.prepare(
+                      "INSERT OR IGNORE INTO adept_credentials (id, device_xml, activation_xml, devicesalt, created_at) VALUES (?, ?, ?, ?, ?)"
+                    ).bind(
+                      id,
+                      base64ToBytes(event["X-Adept-Device-Xml"]),
+                      base64ToBytes(event["X-Adept-Activation-Xml"]),
+                      base64ToBytes(event["X-Adept-Device-Salt"]),
+                      Math.floor(Date.now() / 1000)
+                    ).run().catch((e) => console.error("Failed to persist credentials:", e))
+                  );
+                }
+                continue; // never forward credentials to the browser
+              }
+
+              await writer.write(encoder.encode(line + "\n"));
+            }
+          }
+        } catch (err) {
+          console.error("Stream forwarding error:", err);
+        } finally {
+          try { await writer.close(); } catch {}
+        }
+      })();
+
+      ctx.waitUntil(forward);
+
+      return new Response(readable, {
+        status: 200,
+        headers: { "Content-Type": "application/x-ndjson" },
       });
     }
 

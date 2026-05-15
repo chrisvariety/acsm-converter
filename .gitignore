@@ -12,3 +12,4 @@ Adobe-Digital-Editions/
 *.drm
 .DS_Store
 node_modules
+.wrangler/
