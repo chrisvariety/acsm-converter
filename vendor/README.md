@@ -19,19 +19,19 @@ and builds it. We pre-place it here so that step is skipped (the script only
 clones when the directory is absent).
 
 Upstream: https://forge.soutade.fr/soutade/uPDFParser.git
-Source:   github.com/loganpowell/knock-lambda (deps/uPDFParser)
+Commit:   6060d12 ("Add removeObject() method to parser")
 
 Version matters here: libgourou 324c566 calls `uPDFParser::Parser::removeObject()`
-(in `removePDFDRM`), which only exists in a recent uPDFParser. Older mirrors —
-`SamuelMarks/updfparser` @26b1e0d and the byte-identical `drazulay/updfparser` —
-predate that method, so libgourou fails to compile against them:
+(in `removePDFDRM`), which was only added in upstream commit 6060d12 (current
+HEAD). Older mirrors — `SamuelMarks/updfparser` @26b1e0d and the byte-identical
+`drazulay/updfparser` — predate that commit, so libgourou fails to compile
+against them:
 
     error: 'class uPDFParser::Parser' has no member named 'removeObject'
 
-The knock-lambda copy tracks the newer upstream that adds `removeObject`
-(alongside `prevChar`/`writeBuffer` and some CR/LF parsing fixes) and is the
-correct counterpart to the pinned libgourou. We don't use libgourou's PDF path,
-but the reference is unconditional, so the symbol must be present to link.
+We don't use libgourou's PDF path, but the reference is unconditional, so the
+symbol must be present to link. The vendored sources here are byte-identical to
+upstream HEAD (`src/`, `include/`, `Makefile`).
 
 The stock `Makefile` build (`make BUILD_STATIC=1 BUILD_SHARED=0`) is used; the
 bundled CMake files are inert.
