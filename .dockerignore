@@ -3,5 +3,6 @@
 
 #include the following
 !scripts
+!vendor
 !LICENSE
 !README.md

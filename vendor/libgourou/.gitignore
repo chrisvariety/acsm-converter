@@ -1,0 +1,11 @@
+obj
+lib
+*.o
+*.a
+*.so
+*~
+utils/acsmdownloader
+utils/adept_activate
+utils/adept_remove
+utils/adept_loan_mgt
+.adept*

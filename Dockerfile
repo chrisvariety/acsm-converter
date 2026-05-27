@@ -5,8 +5,6 @@ RUN apt-get update && \
   apt-get install -y \
   build-essential \
   bash \
-  git \
-  wget \
   libzip-dev \
   libssl-dev \
   libcurl4-gnutls-dev \
@@ -14,8 +12,15 @@ RUN apt-get update && \
 
 WORKDIR /usr/src
 
-RUN git clone https://forge.soutade.fr/soutade/libgourou.git \
-  && cd libgourou \
+# Build from vendored sources instead of cloning forge.soutade.fr (which has
+# been unreliable). vendor/libgourou is libgourou @324c566 with its uPDFParser
+# dependency pre-placed at lib/updfparser, so no network access is needed.
+# See vendor/README.md for provenance.
+COPY vendor/libgourou /usr/src/libgourou
+
+RUN cd /usr/src/libgourou/lib/updfparser \
+  && make BUILD_STATIC=1 BUILD_SHARED=0 \
+  && cd /usr/src/libgourou \
   && make BUILD_STATIC=1 STATIC_UTILS=1
 
 FROM ubuntu:jammy
