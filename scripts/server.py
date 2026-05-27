@@ -37,6 +37,9 @@ DECRYPT_TIMEOUT = 90     # adept_remove: local crypto, no network
 # How often to emit a keep-alive status event during a long-running step, so
 # the CDN doesn't sever the (otherwise silent) connection mid-download.
 HEARTBEAT_INTERVAL = 15
+# Read size when streaming the result to the client. A multiple of 3 so each
+# chunk base64-encodes cleanly (padding only ever appears at the true end).
+RESULT_CHUNK = 3 * 1024 * 1024
 
 
 def _extract_user_id(acsm_bytes):
@@ -404,20 +407,13 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 encrypted_path,
             ], timeout=DECRYPT_TIMEOUT)
 
-            with open(decrypted_path, "rb") as f:
-                data = f.read()
-
             content_type = (
                 "application/epub+zip" if output_filename.lower().endswith(".epub")
                 else "application/pdf"
             )
-            print(f"[convert] Success! Returning {output_filename} ({len(data)} bytes)", flush=True)
-            self._send_event({
-                "type": "result",
-                "filename": output_filename,
-                "content_type": content_type,
-                "data_base64": base64.b64encode(data).decode(),
-            })
+            out_size = os.path.getsize(decrypted_path)
+            print(f"[convert] Success! Returning {output_filename} ({out_size} bytes)", flush=True)
+            self._send_file_result(output_filename, content_type, decrypted_path)
 
         except subprocess.CalledProcessError as e:
             output = (e.stdout or "") + (e.stderr or "")
@@ -515,6 +511,37 @@ class ConvertHandler(BaseHTTPRequestHandler):
             self._terminal_sent = True
         line = json.dumps(obj).encode() + b"\n"
         self.wfile.write(line)
+        self.wfile.flush()
+
+    def _send_file_result(self, filename, content_type, path):
+        """Stream the terminal result event, base64-encoding the file from disk
+        in chunks so we never hold the whole (100+ MB) payload in memory.
+
+        The wire format is unchanged: a single NDJSON line holding a JSON object
+        with a `data_base64` field. We let json.dumps build (and escape) the
+        envelope with an empty payload, then split it just inside the opening
+        quote of data_base64 and stream the base64 into the gap. base64 emits no
+        newlines, so the line stays valid NDJSON and the client parser is
+        untouched.
+        """
+        self._terminal_sent = True
+        envelope = json.dumps({
+            "type": "result",
+            "filename": filename,
+            "content_type": content_type,
+            "data_base64": "",
+        })
+        # Empty payload renders as `…"data_base64": ""}`. Drop the closing `"}`
+        # to leave the opening quote open, stream the value, then close it.
+        assert envelope.endswith('""}'), envelope
+        self.wfile.write(envelope[:-2].encode())
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(RESULT_CHUNK)
+                if not chunk:
+                    break
+                self.wfile.write(base64.b64encode(chunk))
+        self.wfile.write(b'"}\n')
         self.wfile.flush()
 
     def _safe_terminal_error(self, message, **extra):
