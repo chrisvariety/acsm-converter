@@ -2,6 +2,7 @@
 """HTTP server for ACSM-to-EPUB/PDF conversion using libgourou tools."""
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -44,20 +45,45 @@ def _extract_user_id(acsm_bytes):
     return match.group(1).strip().decode("ascii", "ignore") if match else None
 
 
+def _cache_key(acsm_bytes):
+    """Stable per-fulfillment credential cache key, with the reason for logs.
+
+    Priority:
+      1. <userId>      Adobe-account files (e.g. Google Play). Kept bare so it
+                       still matches seeded rows and groups a user's loans onto
+                       one device (respecting providers' per-user device limits).
+      2. <transaction> Fulfillment tokens that carry no userId (e.g. OverDrive).
+                       Stable within a given ACSM and unique per fulfillment, so
+                       a retry reuses the device that already holds the loan
+                       instead of minting a new one (which the provider rejects
+                       with E_LIC_ALREADY_FULFILLED_BY_ANOTHER_USER).
+      3. sha256(acsm)  Last resort when neither tag is present — still stable
+                       per file, so retries stay idempotent without pinning
+                       everything to one shared device.
+    """
+    user_id = _extract_user_id(acsm_bytes)
+    if user_id:
+        return user_id, "userId"
+    match = re.search(rb"<transaction>([^<]+)</transaction>", acsm_bytes)
+    if match:
+        return "txn:" + match.group(1).strip().decode("ascii", "ignore"), "transaction"
+    return "acsm:" + hashlib.sha256(acsm_bytes).hexdigest(), "sha256"
+
+
 def _caching_enabled():
     return bool(psycopg2 and DATABASE_URL)
 
 
-def load_cached_creds(user_id):
+def load_cached_creds(cache_key):
     """Return {filename: bytes} for a cached anonymous device, or None."""
-    if not (_caching_enabled() and user_id):
+    if not (_caching_enabled() and cache_key):
         return None
     try:
         with closing(psycopg2.connect(DATABASE_URL)) as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT device_xml, activation_xml, devicesalt "
                 "FROM adept_credentials WHERE id = %s",
-                (user_id,),
+                (cache_key,),
             )
             row = cur.fetchone()
         if not row:
@@ -68,9 +94,9 @@ def load_cached_creds(user_id):
         return None
 
 
-def save_cached_creds(user_id, creds):
+def save_cached_creds(cache_key, creds):
     """Persist freshly activated creds. Best-effort; never raises."""
-    if not (_caching_enabled() and user_id):
+    if not (_caching_enabled() and cache_key):
         return
     try:
         with closing(psycopg2.connect(DATABASE_URL)) as conn:
@@ -81,13 +107,13 @@ def save_cached_creds(user_id, creds):
                     "VALUES (%s, %s, %s, %s, NOW()) "
                     "ON CONFLICT (id) DO NOTHING",
                     (
-                        user_id,
+                        cache_key,
                         psycopg2.Binary(creds["device.xml"]),
                         psycopg2.Binary(creds["activation.xml"]),
                         psycopg2.Binary(creds["devicesalt"]),
                     ),
                 )
-        print(f"[creds] cached credentials for userId={user_id}", flush=True)
+        print(f"[creds] cached credentials for {cache_key}", flush=True)
     except Exception as e:
         print(f"[creds] cache write failed: {e}", flush=True)
 
@@ -307,11 +333,12 @@ class ConvertHandler(BaseHTTPRequestHandler):
             # fresh anonymous device on every request (which burns device slots
             # and trips provider device limits). The container owns this cache
             # directly; nothing credential-related travels over the response.
-            user_id = _extract_user_id(body)
-            print(f"[convert] userId={user_id!r} caching={_caching_enabled()}", flush=True)
-            cached = load_cached_creds(user_id)
+            cache_key, key_kind = _cache_key(body)
+            print(f"[convert] cache_key={cache_key!r} (from {key_kind}) "
+                  f"caching={_caching_enabled()}", flush=True)
+            cached = load_cached_creds(cache_key)
             if cached:
-                print(f"[convert] credential cache HIT for userId={user_id}", flush=True)
+                print(f"[convert] credential cache HIT for {cache_key}", flush=True)
                 self._send_event({"type": "status", "stage": "hydrate",
                                   "message": "Loading cached credentials"})
                 os.makedirs(ADEPT_DIR, exist_ok=True)
@@ -319,19 +346,20 @@ class ConvertHandler(BaseHTTPRequestHandler):
                     with open(os.path.join(ADEPT_DIR, name), "wb") as f:
                         f.write(data)
             else:
-                print(f"[convert] credential cache MISS for userId={user_id}; "
+                print(f"[convert] credential cache MISS for {cache_key}; "
                       "activating a new anonymous device", flush=True)
                 self._send_event({"type": "status", "stage": "activate",
                                   "message": "Activating anonymous Adept account"})
                 self._run(["adept_activate", "--anonymous", "--output-dir", ADEPT_DIR],
                           timeout=ACTIVATE_TIMEOUT)
                 # Persist immediately, before the risky download — so a fresh
-                # activation survives a later download/decrypt failure.
+                # activation survives a later download/decrypt failure and a
+                # retry reuses the device that already holds the loan.
                 fresh = {}
                 for name in CRED_FILES:
                     with open(os.path.join(ADEPT_DIR, name), "rb") as f:
                         fresh[name] = f.read()
-                save_cached_creds(user_id, fresh)
+                save_cached_creds(cache_key, fresh)
 
             self._send_event({"type": "status", "stage": "download",
                               "message": "Downloading encrypted file"})
