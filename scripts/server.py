@@ -9,20 +9,77 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import traceback
+from contextlib import closing
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+try:
+    import psycopg2
+except ImportError:  # caching is optional; server still runs without it
+    psycopg2 = None
 
 _convert_lock = threading.Lock()
 
 ADEPT_DIR = "/home/libgourou/.adept"
 WORK_DIR = "/home/libgourou/work"
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 CRED_FILES = ("device.xml", "activation.xml", "devicesalt")
-CRED_HEADERS = {
-    "device.xml": "X-Adept-Device-Xml",
-    "activation.xml": "X-Adept-Activation-Xml",
-    "devicesalt": "X-Adept-Device-Salt",
-}
+
+
+def _extract_user_id(acsm_bytes):
+    """Pull the Adobe <userId> out of an ACSM file, if present."""
+    match = re.search(rb"<userId>([^<]+)</userId>", acsm_bytes)
+    return match.group(1).strip().decode("ascii", "ignore") if match else None
+
+
+def _caching_enabled():
+    return bool(psycopg2 and DATABASE_URL)
+
+
+def load_cached_creds(user_id):
+    """Return {filename: bytes} for a cached anonymous device, or None."""
+    if not (_caching_enabled() and user_id):
+        return None
+    try:
+        with closing(psycopg2.connect(DATABASE_URL)) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT device_xml, activation_xml, devicesalt "
+                "FROM adept_credentials WHERE id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip(CRED_FILES, (bytes(col) for col in row)))
+    except Exception as e:
+        print(f"[creds] cache read failed: {e}", flush=True)
+        return None
+
+
+def save_cached_creds(user_id, creds):
+    """Persist freshly activated creds. Best-effort; never raises."""
+    if not (_caching_enabled() and user_id):
+        return
+    try:
+        with closing(psycopg2.connect(DATABASE_URL)) as conn:
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO adept_credentials "
+                    "(id, device_xml, activation_xml, devicesalt, created_at) "
+                    "VALUES (%s, %s, %s, %s, NOW()) "
+                    "ON CONFLICT (id) DO NOTHING",
+                    (
+                        user_id,
+                        psycopg2.Binary(creds["device.xml"]),
+                        psycopg2.Binary(creds["activation.xml"]),
+                        psycopg2.Binary(creds["devicesalt"]),
+                    ),
+                )
+        print(f"[creds] cached credentials for userId={user_id}", flush=True)
+    except Exception as e:
+        print(f"[creds] cache write failed: {e}", flush=True)
 
 # Known ADEPT error codes and user-friendly guidance
 KNOWN_ERRORS = {
@@ -198,6 +255,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
 
         # Start NDJSON streaming response. After this point, errors are
         # reported as {"type":"error",...} events, not via HTTP status.
+        self._terminal_sent = False
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Connection", "close")
@@ -219,6 +277,11 @@ class ConvertHandler(BaseHTTPRequestHandler):
             print("[convert] Client disconnected during conversion", flush=True)
         finally:
             _convert_lock.release()
+            # The client interprets a stream that closes with no result/error
+            # as "Conversion ended without a result." Guarantee a terminal event.
+            if not self._terminal_sent:
+                print("[convert] No terminal event sent; emitting fallback error", flush=True)
+                self._safe_terminal_error("Conversion ended unexpectedly without a result")
 
     def _do_convert(self, body):
         work_dir = tempfile.mkdtemp(dir=WORK_DIR)
@@ -230,28 +293,30 @@ class ConvertHandler(BaseHTTPRequestHandler):
             if os.path.exists(ADEPT_DIR):
                 shutil.rmtree(ADEPT_DIR)
 
-            provided = {
-                name: self.headers.get(header)
-                for name, header in CRED_HEADERS.items()
-            }
-            if all(provided.values()):
+            # Credentials are cached per Adobe userId so we don't re-activate a
+            # fresh anonymous device on every request (which burns device slots
+            # and trips provider device limits). The container owns this cache
+            # directly; nothing credential-related travels over the response.
+            user_id = _extract_user_id(body)
+            cached = load_cached_creds(user_id)
+            if cached:
                 self._send_event({"type": "status", "stage": "hydrate",
-                                  "message": "Hydrating credentials from request headers"})
+                                  "message": "Loading cached credentials"})
                 os.makedirs(ADEPT_DIR, exist_ok=True)
-                for name, b64 in provided.items():
+                for name, data in cached.items():
                     with open(os.path.join(ADEPT_DIR, name), "wb") as f:
-                        f.write(base64.b64decode(b64))
+                        f.write(data)
             else:
                 self._send_event({"type": "status", "stage": "activate",
                                   "message": "Activating anonymous Adept account"})
                 self._run(["adept_activate", "--anonymous", "--output-dir", ADEPT_DIR])
-                # Emit fresh creds immediately so the Worker can persist them
-                # even if the rest of the request fails.
-                creds_event = {"type": "credentials"}
+                # Persist immediately, before the risky download — so a fresh
+                # activation survives a later download/decrypt failure.
+                fresh = {}
                 for name in CRED_FILES:
                     with open(os.path.join(ADEPT_DIR, name), "rb") as f:
-                        creds_event[CRED_HEADERS[name]] = base64.b64encode(f.read()).decode()
-                self._send_event(creds_event)
+                        fresh[name] = f.read()
+                save_cached_creds(user_id, fresh)
 
             self._send_event({"type": "status", "stage": "download",
                               "message": "Downloading encrypted file"})
@@ -321,6 +386,14 @@ class ConvertHandler(BaseHTTPRequestHandler):
                     "stdout": e.stdout or "",
                     "stderr": e.stderr or "",
                 })
+        except (BrokenPipeError, ConnectionResetError):
+            raise  # client went away; do_POST logs it, nothing to report
+        except Exception:
+            # Anything else (e.g. a missing decrypted file) would otherwise
+            # propagate and close the socket silently — surface it instead.
+            print("[convert] ERROR: Unexpected exception during conversion:", flush=True)
+            traceback.print_exc()
+            self._safe_terminal_error("Unexpected error during conversion")
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -328,9 +401,18 @@ class ConvertHandler(BaseHTTPRequestHandler):
         return subprocess.run(cmd, check=True, capture_output=True, text=True, **kwargs)
 
     def _send_event(self, obj):
+        if obj.get("type") in ("result", "error"):
+            self._terminal_sent = True
         line = json.dumps(obj).encode() + b"\n"
         self.wfile.write(line)
         self.wfile.flush()
+
+    def _safe_terminal_error(self, message, **extra):
+        """Emit a terminal error event, swallowing write failures."""
+        try:
+            self._send_event({"type": "error", "error": message, **extra})
+        except Exception:
+            pass
 
     def _json_response(self, status, body):
         data = json.dumps(body).encode()

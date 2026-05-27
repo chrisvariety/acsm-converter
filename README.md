@@ -1,22 +1,25 @@
 # ACSM Converter
 
-A web app that converts ACSM files to standard EPUB/PDF files, powered by [libgourou](https://forge.soutade.fr/soutade/libgourou) and deployed on [Cloudflare Containers](https://developers.cloudflare.com/containers/).
+A web app that converts ACSM files to standard EPUB/PDF files, powered by [libgourou](https://forge.soutade.fr/soutade/libgourou). A [Cloudflare Worker](https://developers.cloudflare.com/workers/) serves the UI and proxies to a converter running on [Fly.io](https://fly.io/).
 
 ## How it works
 
 1. User uploads an `.acsm` file through the web interface
-2. The Worker forwards the file to a container running libgourou tools
-3. The container activates an anonymous Adobe device (once per instance), downloads the book, and converts it to a standard format
-4. The converted EPUB or PDF is returned to the user's browser
+2. The Worker forwards the file, unchanged, to the converter on Fly.io and streams the response back to the browser
+3. The converter looks up cached Adobe credentials for the file's `userId` in Postgres (activating a fresh anonymous device and caching it if there's no hit), downloads the book, and removes the DRM
+4. Progress and the final EPUB/PDF are streamed back as newline-delimited JSON (NDJSON) events
+
+The converter owns the credential cache directly (it reads and writes Postgres), so the Worker never sees or handles credentials — it's a transparent proxy.
 
 ## Project structure
 
 ```
-src/index.js       # Cloudflare Worker — serves the UI and proxies to the container
+src/index.js       # Cloudflare Worker — serves the UI and proxies to Fly.io
 scripts/server.py  # Python HTTP server running inside the container
+scripts/schema.sql # Postgres schema for the credential cache
 Dockerfile         # Builds libgourou tools + the HTTP server
-wrangler.jsonc     # Cloudflare Workers/Containers configuration
-fly.toml           # Fly.io configuration (alternate backend, optional)
+wrangler.jsonc     # Cloudflare Worker configuration
+fly.toml           # Fly.io configuration (the converter backend)
 ```
 
 ## Development
@@ -34,48 +37,40 @@ npm run deploy
 
 The app is configured to serve on `www.acsm-converter.com` via a custom domain in `wrangler.jsonc`.
 
-## Fly.io backend (alternate)
+## Fly.io converter backend
 
-The same container can also run on Fly.io. This is useful when Cloudflare Containers' shared egress IPs hit rate limits from content providers (e.g. Google Play's `acs4_book_bytes` endpoint).
+The converter runs on Fly.io rather than Cloudflare Containers, because Cloudflare's shared egress IPs hit rate limits from content providers (e.g. Google Play's `acs4_book_bytes` endpoint).
 
-### Deploy to Fly.io
+### 1. Provision Postgres and apply the schema
+
+The container caches Adobe credentials in Postgres. Any reachable Postgres works (Fly Postgres, Neon, Supabase, …):
+
+```bash
+flyctl postgres create            # or use an existing database
+psql "$DATABASE_URL" -f scripts/schema.sql
+```
+
+Caching is optional — if `DATABASE_URL` is unset the converter still works, but it re-activates a fresh anonymous device on every request.
+
+### 2. Deploy the converter
 
 ```bash
 flyctl launch --no-deploy   # accept the existing fly.toml; pick an app name + region
 flyctl secrets set AUTH_TOKEN=$(openssl rand -hex 32)
+flyctl secrets set DATABASE_URL="postgres://…"   # from step 1
 flyctl deploy
 ```
 
-Note the public URL of the deployed app (e.g. `https://your-app.fly.dev`) and the `AUTH_TOKEN` value you set.
+Note the public URL (e.g. `https://your-app.fly.dev`) and the `AUTH_TOKEN` value.
 
-### Point the Worker at Fly.io
+### 3. Point the Worker at the converter
 
-Store the same token as a Worker secret (one-time):
+The Worker calls the Fly app URL hardcoded in `src/index.js` (`acsm-converter-fly.fly.dev`) — update it if your app name differs. Store the auth token as a Worker secret, then deploy:
 
 ```bash
 npx wrangler secret put FLY_AUTH_TOKEN   # paste the same value used for AUTH_TOKEN above
+npm run deploy
 ```
-
-Then in `src/index.js`, swap the container call:
-
-```js
-// Cloudflare Containers (default):
-const container = getContainer(env.MY_CONTAINER, "default");
-const upstream = await container.fetch("http://container/convert", {
-  method: "POST",
-  headers: containerHeaders,
-  body,
-});
-
-// Fly.io:
-const upstream = await fetch("https://your-app.fly.dev/convert", {
-  method: "POST",
-  headers: { ...containerHeaders, Authorization: `Bearer ${env.FLY_AUTH_TOKEN}` },
-  body,
-});
-```
-
-Then `npm run deploy` (or `npm run dev`) to use Fly.io. Swap back to the container fetch to return to Cloudflare Containers.
 
 ## Known error codes
 

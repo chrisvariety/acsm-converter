@@ -1,33 +1,3 @@
-import { Container, getContainer } from "@cloudflare/containers";
-
-export class MyContainer extends Container {
-  defaultPort = 8080;
-}
-
-function extractAdeptId(acsmBytes) {
-  const text = new TextDecoder().decode(acsmBytes);
-  const match = text.match(/<userId>([^<]+)<\/userId>/);
-  return match ? match[1].trim() : null;
-}
-
-function bytesToBase64(value) {
-  const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : value;
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-function base64ToBytes(b64) {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -247,7 +217,7 @@ const HTML = `<!DOCTYPE html>
 </html>`;
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/" && request.method === "GET") {
@@ -263,90 +233,25 @@ export default {
         return Response.json({ error: "No file uploaded" }, { status: 400 });
       }
 
-      const id = extractAdeptId(body);
-
-      const containerHeaders = { "Content-Type": "application/octet-stream" };
-      if (id) {
-        const cached = await env.ADEPT_DB.prepare(
-          "SELECT device_xml, activation_xml, devicesalt FROM adept_credentials WHERE id = ?"
-        ).bind(id).first();
-        if (cached) {
-          containerHeaders["X-Adept-Device-Xml"] = bytesToBase64(cached.device_xml);
-          containerHeaders["X-Adept-Activation-Xml"] = bytesToBase64(cached.activation_xml);
-          containerHeaders["X-Adept-Device-Salt"] = bytesToBase64(cached.devicesalt);
-        }
-      }
-
+      // Transparent proxy to the converter. The container owns the full
+      // credential lifecycle (it persists to Postgres directly), so the
+      // Worker has nothing to inspect — it just relays the NDJSON stream.
       const upstream = await fetch("https://acsm-converter-fly.fly.dev/convert", {
         method: "POST",
-        headers: { ...containerHeaders, Authorization: `Bearer ${env.FLY_AUTH_TOKEN}` },
+        headers: {
+          "Content-Type": "application/octet-stream",
+          Authorization: `Bearer ${env.FLY_AUTH_TOKEN}`,
+        },
         body,
       });
 
-      // Pre-stream failure (e.g. 401, 400) — surface as-is.
-      if (!upstream.ok) {
-        return new Response(upstream.body, {
-          status: upstream.status,
-          statusText: upstream.statusText,
-          headers: upstream.headers,
-        });
-      }
-
-      // Pipe the NDJSON stream to the browser. Intercept "credentials"
-      // events along the way and persist them to D1 via ctx.waitUntil.
-      const { readable, writable } = new TransformStream();
-      const upstreamReader = upstream.body.getReader();
-      const writer = writable.getWriter();
-      const decoder = new TextDecoder();
-      const encoder = new TextEncoder();
-
-      const forward = (async () => {
-        let buffer = "";
-        try {
-          while (true) {
-            const { done, value } = await upstreamReader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            let idx;
-            while ((idx = buffer.indexOf("\n")) >= 0) {
-              const line = buffer.slice(0, idx);
-              buffer = buffer.slice(idx + 1);
-              if (!line.trim()) continue;
-              let event;
-              try { event = JSON.parse(line); } catch { continue; }
-
-              if (event.type === "credentials") {
-                if (id) {
-                  ctx.waitUntil(
-                    env.ADEPT_DB.prepare(
-                      "INSERT OR IGNORE INTO adept_credentials (id, device_xml, activation_xml, devicesalt, created_at) VALUES (?, ?, ?, ?, ?)"
-                    ).bind(
-                      id,
-                      base64ToBytes(event["X-Adept-Device-Xml"]),
-                      base64ToBytes(event["X-Adept-Activation-Xml"]),
-                      base64ToBytes(event["X-Adept-Device-Salt"]),
-                      Math.floor(Date.now() / 1000)
-                    ).run().catch((e) => console.error("Failed to persist credentials:", e))
-                  );
-                }
-                continue; // never forward credentials to the browser
-              }
-
-              await writer.write(encoder.encode(line + "\n"));
-            }
-          }
-        } catch (err) {
-          console.error("Stream forwarding error:", err);
-        } finally {
-          try { await writer.close(); } catch {}
-        }
-      })();
-
-      ctx.waitUntil(forward);
-
-      return new Response(readable, {
-        status: 200,
-        headers: { "Content-Type": "application/x-ndjson" },
+      return new Response(upstream.body, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: {
+          "Content-Type":
+            upstream.headers.get("Content-Type") || "application/x-ndjson",
+        },
       });
     }
 

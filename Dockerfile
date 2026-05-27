@@ -30,6 +30,7 @@ RUN apt-get update && \
   DEBIAN_FRONTEND=noninteractive TZ="America/Los_Angeles" \
   apt-get install -y \
   python3 \
+  python3-psycopg2 \
   libpugixml1v5 \
   libzip4 \
   libssl3 \

@@ -2,33 +2,18 @@
   "name": "acsm-converter",
   "main": "src/index.js",
   "compatibility_date": "2026-04-16",
-  "containers": [
-    {
-      "class_name": "MyContainer",
-      "image": "./Dockerfile",
-      "max_instances": 1,
-    },
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "class_name": "MyContainer",
-        "name": "MY_CONTAINER",
-      },
-    ],
-  },
+  // The converter now runs on Fly.io and owns its own Postgres-backed
+  // credential cache, so the Worker is a thin proxy: no Cloudflare Container,
+  // no Durable Object, no D1 binding. The migrations below record that the
+  // MyContainer Durable Object class (created in v1) has been removed.
   "migrations": [
     {
       "new_sqlite_classes": ["MyContainer"],
       "tag": "v1",
     },
-  ],
-  "d1_databases": [
     {
-      "binding": "ADEPT_DB",
-      "database_name": "acsm-converter",
-      "database_id": "40318abc-4c54-4bde-ae36-9aa0cc3f5029",
-      "migrations_dir": "migrations",
+      "deleted_classes": ["MyContainer"],
+      "tag": "v2",
     },
   ],
   "routes": [
