@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import traceback
 from contextlib import closing
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -26,6 +27,15 @@ AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 CRED_FILES = ("device.xml", "activation.xml", "devicesalt")
+
+# Hard ceilings so a stalled provider connection can't hang the request
+# forever (which holds the convert lock and silently times out at the CDN).
+ACTIVATE_TIMEOUT = 90    # adept_activate: a couple of Adobe round-trips
+DOWNLOAD_TIMEOUT = 180   # acsmdownloader: fetch the (DRM'd) book over the net
+DECRYPT_TIMEOUT = 90     # adept_remove: local crypto, no network
+# How often to emit a keep-alive status event during a long-running step, so
+# the CDN doesn't sever the (otherwise silent) connection mid-download.
+HEARTBEAT_INTERVAL = 15
 
 
 def _extract_user_id(acsm_bytes):
@@ -298,8 +308,10 @@ class ConvertHandler(BaseHTTPRequestHandler):
             # and trips provider device limits). The container owns this cache
             # directly; nothing credential-related travels over the response.
             user_id = _extract_user_id(body)
+            print(f"[convert] userId={user_id!r} caching={_caching_enabled()}", flush=True)
             cached = load_cached_creds(user_id)
             if cached:
+                print(f"[convert] credential cache HIT for userId={user_id}", flush=True)
                 self._send_event({"type": "status", "stage": "hydrate",
                                   "message": "Loading cached credentials"})
                 os.makedirs(ADEPT_DIR, exist_ok=True)
@@ -307,9 +319,12 @@ class ConvertHandler(BaseHTTPRequestHandler):
                     with open(os.path.join(ADEPT_DIR, name), "wb") as f:
                         f.write(data)
             else:
+                print(f"[convert] credential cache MISS for userId={user_id}; "
+                      "activating a new anonymous device", flush=True)
                 self._send_event({"type": "status", "stage": "activate",
                                   "message": "Activating anonymous Adept account"})
-                self._run(["adept_activate", "--anonymous", "--output-dir", ADEPT_DIR])
+                self._run(["adept_activate", "--anonymous", "--output-dir", ADEPT_DIR],
+                          timeout=ACTIVATE_TIMEOUT)
                 # Persist immediately, before the risky download — so a fresh
                 # activation survives a later download/decrypt failure.
                 fresh = {}
@@ -320,9 +335,12 @@ class ConvertHandler(BaseHTTPRequestHandler):
 
             self._send_event({"type": "status", "stage": "download",
                               "message": "Downloading encrypted file"})
+            print("[convert] starting download (acsmdownloader)", flush=True)
             result = self._run(
                 ["acsmdownloader", "--adept-directory", ADEPT_DIR, acsm_path],
                 cwd=work_dir,
+                timeout=DOWNLOAD_TIMEOUT,
+                heartbeat_stage="download",
             )
 
             # acsmdownloader prints lines like "Created File Name.epub" — first
@@ -345,6 +363,9 @@ class ConvertHandler(BaseHTTPRequestHandler):
 
             encrypted_path = os.path.join(work_dir, output_filename)
             decrypted_path = os.path.join(work_dir, "decrypted_" + output_filename)
+            enc_size = os.path.getsize(encrypted_path) if os.path.exists(encrypted_path) else -1
+            print(f"[convert] downloaded {output_filename!r} ({enc_size} bytes); removing DRM",
+                  flush=True)
 
             self._send_event({"type": "status", "stage": "decrypt",
                               "message": "Removing DRM"})
@@ -353,7 +374,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 "--adept-directory", ADEPT_DIR,
                 "--output-file", decrypted_path,
                 encrypted_path,
-            ])
+            ], timeout=DECRYPT_TIMEOUT)
 
             with open(decrypted_path, "rb") as f:
                 data = f.read()
@@ -386,6 +407,13 @@ class ConvertHandler(BaseHTTPRequestHandler):
                     "stdout": e.stdout or "",
                     "stderr": e.stderr or "",
                 })
+        except subprocess.TimeoutExpired as e:
+            label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
+            print(f"[convert] ERROR: {label} timed out after {e.timeout}s", flush=True)
+            self._safe_terminal_error(
+                "The download timed out. The content provider's server may be "
+                "slow or unreachable right now — please try again in a few minutes."
+            )
         except (BrokenPipeError, ConnectionResetError):
             raise  # client went away; do_POST logs it, nothing to report
         except Exception:
@@ -397,8 +425,62 @@ class ConvertHandler(BaseHTTPRequestHandler):
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    def _run(self, cmd, **kwargs):
-        return subprocess.run(cmd, check=True, capture_output=True, text=True, **kwargs)
+    def _run(self, cmd, *, timeout=None, heartbeat_stage=None, **kwargs):
+        """Run a command, logging timing and output.
+
+        Enforces `timeout` (raising subprocess.TimeoutExpired and killing the
+        child) so a stalled network call can't hang the request forever. When
+        `heartbeat_stage` is set, emits a periodic status event while the
+        command runs so the CDN doesn't sever an otherwise-silent connection.
+        """
+        label = os.path.basename(cmd[0])
+        print(f"[run] $ {' '.join(cmd)} (timeout={timeout}s)", flush=True)
+        start = time.monotonic()
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kwargs
+        )
+        last_beat = start
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                elapsed = now - start
+                if timeout is not None and elapsed >= timeout:
+                    proc.kill()
+                    stdout, stderr = proc.communicate()
+                    print(f"[run] {label} TIMED OUT after {elapsed:.0f}s", flush=True)
+                    self._log_output(label, stdout, stderr)
+                    raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+                if heartbeat_stage and now - last_beat >= HEARTBEAT_INTERVAL:
+                    print(f"[run] {label} still running after {elapsed:.0f}s", flush=True)
+                    try:
+                        self._send_event({"type": "status", "stage": heartbeat_stage,
+                                          "message": f"Still working ({int(elapsed)}s)"})
+                    except (BrokenPipeError, ConnectionResetError):
+                        # Client/CDN went away — stop wasting work on a dead socket.
+                        print(f"[run] {label} client disconnected; killing", flush=True)
+                        proc.kill()
+                        proc.communicate()
+                        raise
+                    last_beat = now
+
+        elapsed = time.monotonic() - start
+        rc = proc.returncode
+        print(f"[run] {label} exited rc={rc} in {elapsed:.1f}s "
+              f"(stdout={len(stdout)}b stderr={len(stderr)}b)", flush=True)
+        self._log_output(label, stdout, stderr)
+        if rc != 0:
+            raise subprocess.CalledProcessError(rc, cmd, output=stdout, stderr=stderr)
+        return subprocess.CompletedProcess(cmd, rc, stdout, stderr)
+
+    @staticmethod
+    def _log_output(label, stdout, stderr):
+        if stdout and stdout.strip():
+            print(f"[run] {label} stdout: {stdout.strip()[:2000]}", flush=True)
+        if stderr and stderr.strip():
+            print(f"[run] {label} stderr: {stderr.strip()[:2000]}", flush=True)
 
     def _send_event(self, obj):
         if obj.get("type") in ("result", "error"):
