@@ -37,6 +37,13 @@ const HTML = `<!DOCTYPE html>
     .error-detail h3 { font-size: 0.95rem; margin: 1rem 0 0.25rem; color: #444; }
     .error-detail ul { margin: 0; padding-left: 1.25rem; }
     .error-detail li { margin: 0.5rem 0; color: #333; }
+
+    .log-controls { margin-top: 1rem; text-align: left; }
+    .log-controls .support { font-size: 0.9rem; color: #333; margin: 0 0 0.75rem; }
+    .log-controls .support a { color: #1a1a2e; }
+    .log-toggle { padding: 0.3rem 0.9rem; font-size: 0.85rem; background: #555; }
+    .log-toggle:hover { background: #333; }
+    .log-output { margin-top: 0.75rem; background: #1a1a2e; color: #e0e0e0; padding: 0.75rem 1rem; border-radius: 4px; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
   </style>
 </head>
 <body>
@@ -81,6 +88,10 @@ const HTML = `<!DOCTYPE html>
     const form = document.getElementById("form");
     const status = document.getElementById("status");
 
+    // Raw NDJSON lines for the current conversion, surfaced via "Show log" on
+    // failure so users can copy the same stream they'd see in dev tools.
+    let eventLog = [];
+
     const STAGE_LABELS = {
       hydrate: "Starting...",
       activate: "Preparing...",
@@ -92,6 +103,7 @@ const HTML = `<!DOCTYPE html>
       e.preventDefault();
       const file = form.file.files[0];
       if (!file) return;
+      eventLog = [];
       setStatus("Uploading...");
       try {
         const resp = await fetch("/convert", {
@@ -166,6 +178,7 @@ const HTML = `<!DOCTYPE html>
           const line = buffer.slice(0, idx).trim();
           buffer = buffer.slice(idx + 1);
           if (!line) continue;
+          eventLog.push(line);
           try { onEvent(JSON.parse(line)); } catch (_) {}
         }
       }
@@ -185,9 +198,54 @@ const HTML = `<!DOCTYPE html>
     }
 
     function showPlainError(msg) {
-      status.innerText = msg;
       status.className = "error";
-      status.style.whiteSpace = "pre-wrap";
+      status.style.whiteSpace = "";
+      status.innerHTML = "";
+      const detail = document.createElement("div");
+      detail.style.whiteSpace = "pre-wrap";
+      detail.innerText = msg;
+      status.appendChild(detail);
+      // Plain errors carry no E_ code (timeouts, crashes, network failures,
+      // "ended without a result"), so always offer the support contact.
+      showLogControls(true);
+    }
+
+    // Append a "Show log" toggle (and, for unexpected errors, a Reddit support
+    // line) below whatever error message is already in #status.
+    function showLogControls(showSupport) {
+      const controls = document.createElement("div");
+      controls.className = "log-controls";
+
+      if (showSupport) {
+        const support = document.createElement("p");
+        support.className = "support";
+        support.innerHTML =
+          'Still stuck? Did you read the error message and try again after a few minutes? Message <a href="https://www.reddit.com/user/chrisvariety" target="_blank" rel="noopener">u/chrisvariety</a> on Reddit for support, include the log below along with any info on the epub file you were trying to convert e.g. where you got it, what kind of book it is (for example, a novel or a textbook or a cookbook), and any other relevant details.';
+        controls.appendChild(support);
+      }
+
+      if (eventLog.length) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "log-toggle";
+        btn.textContent = "Show log";
+
+        const pre = document.createElement("pre");
+        pre.className = "log-output";
+        pre.style.display = "none";
+        pre.textContent = eventLog.join("\\n");
+
+        btn.addEventListener("click", () => {
+          const hidden = pre.style.display === "none";
+          pre.style.display = hidden ? "block" : "none";
+          btn.textContent = hidden ? "Hide log" : "Show log";
+        });
+
+        controls.appendChild(btn);
+        controls.appendChild(pre);
+      }
+
+      status.appendChild(controls);
     }
 
     function showKnownError(err) {
@@ -205,6 +263,11 @@ const HTML = `<!DOCTYPE html>
       html += '</div>';
       status.innerHTML = html;
       status.className = "";
+      // E_* codes are well-understood provider/account errors with self-service
+      // fixes above — no need to send those users to Reddit. Everything else
+      // (timeouts, crashes, rate limits, unknowns) is worth flagging to me.
+      const isExpected = err.error_code && err.error_code.startsWith("E_");
+      showLogControls(!isExpected);
     }
 
     function esc(s) {
@@ -236,14 +299,17 @@ export default {
       // Transparent proxy to the converter. The container owns the full
       // credential lifecycle (it persists to Postgres directly), so the
       // Worker has nothing to inspect — it just relays the NDJSON stream.
-      const upstream = await fetch("https://acsm-converter-fly.fly.dev/convert", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/octet-stream",
-          Authorization: `Bearer ${env.FLY_AUTH_TOKEN}`,
+      const upstream = await fetch(
+        "https://acsm-converter-fly.fly.dev/convert",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            Authorization: `Bearer ${env.FLY_AUTH_TOKEN}`,
+          },
+          body,
         },
-        body,
-      });
+      );
 
       return new Response(upstream.body, {
         status: upstream.status,
