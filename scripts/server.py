@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -33,7 +34,7 @@ CRED_FILES = ("device.xml", "activation.xml", "devicesalt")
 # forever (which holds the convert lock and silently times out at the CDN).
 ACTIVATE_TIMEOUT = 90    # adept_activate: a couple of Adobe round-trips
 DOWNLOAD_TIMEOUT = 180   # acsmdownloader: fetch the (DRM'd) book over the net
-DECRYPT_TIMEOUT = 90     # adept_remove: local crypto, no network
+DECRYPT_TIMEOUT = 240    # adept_remove: local crypto, no network, but time scales with book size
 # How often to emit a keep-alive status event during a long-running step, so
 # the CDN doesn't sever the (otherwise silent) connection mid-download.
 HEARTBEAT_INTERVAL = 15
@@ -253,7 +254,157 @@ KNOWN_ERRORS = {
             },
         ],
     },
+    # libgourou's curl client (CURLE_OPERATION_TIMEDOUT, exception code 0x500b)
+    # gives up before our DOWNLOAD_TIMEOUT does -- acsmdownloader exits rc=1 on
+    # its own with this text in stdout, so it surfaces as a CalledProcessError,
+    # NOT our wrapper's TimeoutExpired. See TIMEOUT_GUIDANCE["acsmdownloader"]
+    # for the matching card when our 180s ceiling fires instead.
+    "Timeout was reached": {
+        "title": "The download timed out",
+        "description": (
+            "The converter reached your content provider's server, but the "
+            "download didn't finish in time. This usually means the provider's "
+            "server is slow, overloaded, or temporarily unreachable -- it's "
+            "almost always a short-lived problem on their end, not with your file."
+        ),
+        "solutions": [
+            {
+                "heading": "Wait a few minutes and try again",
+                "text": (
+                    "Provider slowdowns are usually temporary. Wait a few "
+                    "minutes and convert the same file again."
+                ),
+            },
+            {
+                "heading": "Try a fresh ACSM file",
+                "text": (
+                    "If it keeps timing out, download a new ACSM file from your "
+                    "content provider and try converting that instead."
+                ),
+            },
+        ],
+    },
 }
+
+
+# Friendly cards for our own wrapper timeouts (subprocess.TimeoutExpired —
+# emitted when _run kills a hung child after its per-step ceiling). Keyed by
+# command basename. Each entry mirrors the KNOWN_ERRORS shape so the frontend's
+# showKnownError renders it as a structured card rather than a raw blob.
+TIMEOUT_GUIDANCE = {
+    "acsmdownloader": {
+        "error_code": "Download timeout",
+        "title": "The download timed out",
+        "description": (
+            "The converter took too long downloading your book from the content "
+            "provider. This usually means the provider's server is slow or "
+            "temporarily unreachable -- almost always a short-lived problem on "
+            "their end."
+        ),
+        "solutions": [
+            {
+                "heading": "Wait a few minutes and try again",
+                "text": (
+                    "Provider slowdowns are usually temporary. Wait a few "
+                    "minutes and convert the same file again."
+                ),
+            },
+            {
+                "heading": "Try a fresh ACSM file",
+                "text": (
+                    "If it keeps timing out, download a new ACSM file from your "
+                    "content provider and try converting that instead."
+                ),
+            },
+        ],
+    },
+    "adept_remove": {
+        "error_code": "Decryption timeout",
+        "title": "DRM removal took too long",
+        "description": (
+            "The local DRM-removal step ran past its time budget. This step "
+            "doesn't touch the network -- it usually means the file is unusually "
+            "large or the converter is under heavy load."
+        ),
+        "solutions": [
+            {
+                "heading": "Try again",
+                "text": (
+                    "Wait a moment and convert the same file again. If the "
+                    "server was busy, the next attempt often succeeds."
+                ),
+            },
+        ],
+    },
+    "adept_activate": {
+        "error_code": "Activation timeout",
+        "title": "Account activation timed out",
+        "description": (
+            "The converter couldn't activate a new anonymous Adobe account in "
+            "time. This is a one-time setup step talking to Adobe and usually "
+            "means Adobe's activation service is slow or temporarily unreachable."
+        ),
+        "solutions": [
+            {
+                "heading": "Try again",
+                "text": "Wait a few minutes and try converting again.",
+            },
+        ],
+    },
+    # Fallback when a future _run call gets its own heartbeat_stage and timeout
+    # but doesn't have a tailored card here.
+    "_default": {
+        "error_code": "Operation timeout",
+        "title": "An internal step timed out",
+        "description": (
+            "Part of the conversion took too long and was aborted. This is "
+            "usually a transient issue."
+        ),
+        "solutions": [
+            {
+                "heading": "Try again",
+                "text": "Wait a moment and try converting the same file again.",
+            },
+        ],
+    },
+}
+
+# Card for the silent-crash case: subprocess returncode < 0 means the child was
+# killed by a signal (e.g. -9 SIGKILL on OOM, -11 SIGSEGV on segfault). These
+# typically come back with empty stdout/stderr.
+SIGNAL_GUIDANCE = {
+    "title": "The converter crashed unexpectedly",
+    "description": (
+        "A part of the conversion was killed before it could finish -- usually "
+        "a transient memory-pressure spike or an internal crash on an unusual "
+        "file. Trying again often succeeds."
+    ),
+    "solutions": [
+        {
+            "heading": "Try again",
+            "text": (
+                "Wait a moment and convert the same file again. If it keeps "
+                "failing on the same file, the file may be too large or unusual "
+                "for the converter to handle right now."
+            ),
+        },
+    ],
+}
+
+
+def _signal_name(returncode):
+    """Name of the signal that killed a subprocess, or None for normal exits.
+
+    `subprocess` reports `returncode = -N` when the child was terminated by
+    signal N (e.g. -9 = SIGKILL, -11 = SIGSEGV). Lets the error event
+    distinguish a crash/OOM-kill from a regular non-zero exit.
+    """
+    if returncode is None or returncode >= 0:
+        return None
+    try:
+        return signal.Signals(-returncode).name
+    except ValueError:
+        return f"signal {-returncode}"
 
 
 def _match_known_error(output):
@@ -354,7 +505,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 self._send_event({"type": "status", "stage": "activate",
                                   "message": "Activating anonymous Adept account"})
                 self._run(["adept_activate", "--anonymous", "--output-dir", ADEPT_DIR],
-                          timeout=ACTIVATE_TIMEOUT)
+                          timeout=ACTIVATE_TIMEOUT, heartbeat_stage="activate")
                 # Persist immediately, before the risky download — so a fresh
                 # activation survives a later download/decrypt failure and a
                 # retry reuses the device that already holds the loan.
@@ -405,7 +556,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 "--adept-directory", ADEPT_DIR,
                 "--output-file", decrypted_path,
                 encrypted_path,
-            ], timeout=DECRYPT_TIMEOUT)
+            ], timeout=DECRYPT_TIMEOUT, heartbeat_stage="decrypt")
 
             content_type = (
                 "application/epub+zip" if output_filename.lower().endswith(".epub")
@@ -417,27 +568,47 @@ class ConvertHandler(BaseHTTPRequestHandler):
 
         except subprocess.CalledProcessError as e:
             output = (e.stdout or "") + (e.stderr or "")
-            print(f"[convert] ERROR: Command failed: {e.cmd}", flush=True)
+            label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
+            sig = _signal_name(e.returncode)
+            sig_suffix = f" ({sig})" if sig else ""
+            print(f"[convert] ERROR: {label} failed rc={e.returncode}{sig_suffix}", flush=True)
             print(f"[convert] stdout: {e.stdout}", flush=True)
             print(f"[convert] stderr: {e.stderr}", flush=True)
 
             error_code, known = _match_known_error(output)
             if known:
                 self._send_event({"type": "error", "error_code": error_code, **known})
+            elif e.returncode is not None and e.returncode < 0:
+                # Killed by a signal — empty stdout/stderr is typical.
+                # Render a structured "internal failure" card so the user gets
+                # retry guidance instead of a raw blob, and include returncode/signal
+                # for power users reading NDJSON.
+                self._send_event({
+                    "type": "error",
+                    **SIGNAL_GUIDANCE,
+                    "error_code": f"Internal failure ({sig or 'crash'})",
+                    "command": label,
+                    "returncode": e.returncode,
+                })
             else:
                 self._send_event({
                     "type": "error",
-                    "error": f"Command failed: {e.cmd}",
+                    "error": f"{label} failed (exit {e.returncode})",
+                    "command": label,
+                    "returncode": e.returncode,
                     "stdout": e.stdout or "",
                     "stderr": e.stderr or "",
                 })
         except subprocess.TimeoutExpired as e:
             label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
             print(f"[convert] ERROR: {label} timed out after {e.timeout}s", flush=True)
-            self._safe_terminal_error(
-                "The download timed out. The content provider's server may be "
-                "slow or unreachable right now — please try again in a few minutes."
-            )
+            guidance = TIMEOUT_GUIDANCE.get(label, TIMEOUT_GUIDANCE["_default"])
+            self._safe_terminal_event({
+                "type": "error",
+                **guidance,
+                "command": label,
+                "timeout_seconds": e.timeout,
+            })
         except (BrokenPipeError, ConnectionResetError):
             raise  # client went away; do_POST logs it, nothing to report
         except Exception:
@@ -544,12 +715,16 @@ class ConvertHandler(BaseHTTPRequestHandler):
         self.wfile.write(b'"}\n')
         self.wfile.flush()
 
-    def _safe_terminal_error(self, message, **extra):
-        """Emit a terminal error event, swallowing write failures."""
+    def _safe_terminal_event(self, event):
+        """Emit a terminal event, swallowing write failures."""
         try:
-            self._send_event({"type": "error", "error": message, **extra})
+            self._send_event(event)
         except Exception:
             pass
+
+    def _safe_terminal_error(self, message, **extra):
+        """Emit a terminal error event, swallowing write failures."""
+        self._safe_terminal_event({"type": "error", "error": message, **extra})
 
     def _json_response(self, status, body):
         data = json.dumps(body).encode()
