@@ -121,6 +121,43 @@ def save_cached_creds(cache_key, creds):
     except Exception as e:
         print(f"[creds] cache write failed: {e}", flush=True)
 
+# Shared card for upstream 5xx responses (libgourou exception 0x5011,
+# CLIENT_HTTP_ERROR). Raised whenever Adobe's ACS (adeactivate.adobe.com) or the
+# provider's distributor answers with a gateway/server error. libgourou retries
+# curl-level failures 5x but returns HTTP >= 400 straight to us with no retry
+# (vendor/libgourou/utils/drmprocessorclientimpl.cpp), so one bad gateway kills
+# the whole run. Nothing about the user's file or account is at fault.
+UPSTREAM_UNAVAILABLE = {
+    # Nothing for me to debug and nothing the user can do but wait, so the
+    # frontend suppresses the "message me on Reddit" prompt for this card.
+    "transient": True,
+    "title": "Adobe's DRM servers are temporarily unavailable",
+    "description": (
+        "The converter got a server error (HTTP 5xx) from Adobe or your "
+        "content provider. This is an outage on their side -- there is "
+        "nothing wrong with your ACSM file or your account, and it clears "
+        "on its own once their servers recover."
+    ),
+    "solutions": [
+        {
+            "heading": "Wait and try again",
+            "text": (
+                "These outages are usually short-lived. Wait 10-15 minutes "
+                "and convert the same file again -- no need to download a "
+                "new one."
+            ),
+        },
+        {
+            "heading": "If it persists for hours",
+            "text": (
+                "A longer Adobe outage affects every ACSM tool, not just "
+                "this one. Nothing on your end will fix it; try again "
+                "later in the day."
+            ),
+        },
+    ],
+}
+
 # Known ADEPT error codes and user-friendly guidance
 KNOWN_ERRORS = {
     "E_LIC_ALREADY_FULFILLED_BY_ANOTHER_USER": {
@@ -254,6 +291,12 @@ KNOWN_ERRORS = {
             },
         ],
     },
+    # Adobe/provider-side outages. Separate keys because _match_known_error does
+    # plain substring matching; they all share one card.
+    "HTTP Error code 500": UPSTREAM_UNAVAILABLE,
+    "HTTP Error code 502": UPSTREAM_UNAVAILABLE,
+    "HTTP Error code 503": UPSTREAM_UNAVAILABLE,
+    "HTTP Error code 504": UPSTREAM_UNAVAILABLE,
     # libgourou's curl client (CURLE_OPERATION_TIMEDOUT, exception code 0x500b)
     # gives up before our DOWNLOAD_TIMEOUT does -- acsmdownloader exits rc=1 on
     # its own with this text in stdout, so it surfaces as a CalledProcessError,

@@ -264,9 +264,11 @@ const HTML = `<!DOCTYPE html>
       status.innerHTML = html;
       status.className = "";
       // E_* codes are well-understood provider/account errors with self-service
-      // fixes above — no need to send those users to Reddit. Everything else
+      // fixes above, and transient:true marks upstream outages that clear on
+      // their own — no need to send either group to Reddit. Everything else
       // (timeouts, crashes, rate limits, unknowns) is worth flagging to me.
-      const isExpected = err.error_code && err.error_code.startsWith("E_");
+      const isExpected =
+        err.transient === true || (err.error_code && err.error_code.startsWith("E_"));
       showLogControls(!isExpected);
     }
 
