@@ -44,6 +44,11 @@ const HTML = `<!DOCTYPE html>
     .log-toggle { padding: 0.3rem 0.9rem; font-size: 0.85rem; background: #555; }
     .log-toggle:hover { background: #333; }
     .log-output { margin-top: 0.75rem; background: #1a1a2e; color: #e0e0e0; padding: 0.75rem 1rem; border-radius: 4px; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
+
+    .footer { margin-top: 3rem; padding-top: 2rem; border-top: 1px solid #eee; text-align: center; }
+    .footer a { display: inline-block; color: #999; }
+    .footer a:hover { color: #1a1a2e; }
+    .footer svg { width: 24px; height: 24px; fill: currentColor; display: block; }
   </style>
 </head>
 <body>
@@ -83,6 +88,12 @@ const HTML = `<!DOCTYPE html>
       <h3>Nothing stored</h3>
       <p>Files are processed in memory and discarded immediately. We don't keep your books or your data.</p>
     </div>
+  </div>
+
+  <div class="footer">
+    <a href="https://github.com/chrisvariety/acsm-converter" target="_blank" rel="noopener" title="View the source on GitHub" aria-label="View the source on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+    </a>
   </div>
   <script>
     const form = document.getElementById("form");
@@ -210,8 +221,8 @@ const HTML = `<!DOCTYPE html>
       showLogControls(true);
     }
 
-    // Append a "Show log" toggle (and, for unexpected errors, a Reddit support
-    // line) below whatever error message is already in #status.
+    // Append a "Show log" toggle (and, for unexpected errors, a link to file a
+    // GitHub issue) below whatever error message is already in #status.
     function showLogControls(showSupport) {
       const controls = document.createElement("div");
       controls.className = "log-controls";
@@ -220,7 +231,7 @@ const HTML = `<!DOCTYPE html>
         const support = document.createElement("p");
         support.className = "support";
         support.innerHTML =
-          'Still stuck? Did you read the error message and try again after a few minutes? Message <a href="https://www.reddit.com/user/chrisvariety" target="_blank" rel="noopener">u/chrisvariety</a> on Reddit for support, include the log below along with any info on the epub file you were trying to convert e.g. where you got it, what kind of book it is (for example, a novel or a textbook or a cookbook), and any other relevant details.';
+          'Still stuck? Did you read the error message and try again after a few minutes? <a href="https://github.com/chrisvariety/acsm-converter/issues/new" target="_blank" rel="noopener">Open an issue on GitHub</a> for support, and include the log below along with any info on the book you were trying to convert e.g. where you got it, what kind of book it is (for example, a novel or a textbook or a cookbook), and any other relevant details.';
         controls.appendChild(support);
       }
 
@@ -265,7 +276,7 @@ const HTML = `<!DOCTYPE html>
       status.className = "";
       // E_* codes are well-understood provider/account errors with self-service
       // fixes above, and transient:true marks upstream outages that clear on
-      // their own — no need to send either group to Reddit. Everything else
+      // their own — neither group warrants an issue. Everything else
       // (timeouts, crashes, rate limits, unknowns) is worth flagging to me.
       const isExpected =
         err.transient === true || (err.error_code && err.error_code.startsWith("E_"));
