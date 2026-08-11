@@ -33,8 +33,21 @@ CRED_FILES = ("device.xml", "activation.xml", "devicesalt")
 # Hard ceilings so a stalled provider connection can't hang the request
 # forever (which holds the convert lock and silently times out at the CDN).
 ACTIVATE_TIMEOUT = 90    # adept_activate: a couple of Adobe round-trips
-DOWNLOAD_TIMEOUT = 180   # acsmdownloader: fetch the (DRM'd) book over the net
-DECRYPT_TIMEOUT = 240    # adept_remove: local crypto, no network, but time scales with book size
+# acsmdownloader: fulfill the loan AND fetch the (DRM'd) book over the net.
+# Generous on purpose. Tripping this is not a recoverable "try again" -- fulfill()
+# runs before download() in one process (vendor/libgourou/utils/acsmdownloader.cpp:85),
+# the FulfillmentItem lives only in memory, and --resume only affects the file
+# write. So a kill during download consumes a single-use fulfillment token and
+# every retry goes back through /Fulfill, which some operators refuse with
+# E_LIC_ALREADY_FULFILLED_BY_ANOTHER_USER -- permanently bricking that ACSM.
+# Waiting on a slow provider is far cheaper than that, so err high.
+DOWNLOAD_TIMEOUT = 600
+# adept_remove: local crypto, no network, but time scales with book size on a
+# single shared vCPU. Raised alongside DOWNLOAD_TIMEOUT: the large books that
+# used to die during download now reach this stage, so a tight ceiling here
+# would just move the same failure one step later -- and by this point the
+# fulfillment token is already spent, so timing out is equally unrecoverable.
+DECRYPT_TIMEOUT = 480
 # How often to emit a keep-alive status event during a long-running step, so
 # the CDN doesn't sever the (otherwise silent) connection mid-download.
 HEARTBEAT_INTERVAL = 15
@@ -297,11 +310,15 @@ KNOWN_ERRORS = {
     "HTTP Error code 502": UPSTREAM_UNAVAILABLE,
     "HTTP Error code 503": UPSTREAM_UNAVAILABLE,
     "HTTP Error code 504": UPSTREAM_UNAVAILABLE,
-    # libgourou's curl client (CURLE_OPERATION_TIMEDOUT, exception code 0x500b)
-    # gives up before our DOWNLOAD_TIMEOUT does -- acsmdownloader exits rc=1 on
-    # its own with this text in stdout, so it surfaces as a CalledProcessError,
-    # NOT our wrapper's TimeoutExpired. See TIMEOUT_GUIDANCE["acsmdownloader"]
-    # for the matching card when our 180s ceiling fires instead.
+    # libgourou's curl client (CURLE_OPERATION_TIMEDOUT, exception code 0x500b):
+    # acsmdownloader exits rc=1 on its own with this text in stdout, so it
+    # surfaces as a CalledProcessError, NOT our wrapper's TimeoutExpired.
+    # drmprocessorclientimpl.cpp sets no CURLOPT_TIMEOUT/CONNECTTIMEOUT, so curl
+    # only raises this on its ~300s connect/DNS default -- never on a slow but
+    # progressing transfer, which runs until our ceiling. Since DOWNLOAD_TIMEOUT
+    # is now 600s, curl wins that race for connection stalls (it used to lose to
+    # the old 180s). See TIMEOUT_GUIDANCE["acsmdownloader"] for the card shown
+    # when our ceiling fires instead, i.e. a genuinely slow transfer.
     "Timeout was reached": {
         "title": "The download timed out",
         "description": (
