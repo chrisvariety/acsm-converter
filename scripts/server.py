@@ -15,6 +15,7 @@ import time
 import traceback
 from contextlib import closing
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlsplit
 
 try:
     import psycopg2
@@ -56,45 +57,104 @@ HEARTBEAT_INTERVAL = 15
 RESULT_CHUNK = 3 * 1024 * 1024
 
 
-def _extract_user_id(acsm_bytes):
-    """Pull the Adobe <userId> out of an ACSM file, if present."""
-    match = re.search(rb"<userId>([^<]+)</userId>", acsm_bytes)
+def _extract_tag(acsm_bytes, tag):
+    """Pull the text of an ADEPT tag out of an ACSM file, if present.
+
+    Returns the first match; ACSM tags we key on appear once, except <resource>
+    (repeated inside licenseToken with the same value), so first-match is stable.
+    """
+    pattern = rb"<%s>([^<]+)</%s>" % (tag.encode(), tag.encode())
+    match = re.search(pattern, acsm_bytes)
     return match.group(1).strip().decode("ascii", "ignore") if match else None
 
 
+def _extract_user_id(acsm_bytes):
+    """Pull the Adobe <userId> out of an ACSM file, if present."""
+    return _extract_tag(acsm_bytes, "userId")
+
+
 def _cache_key(acsm_bytes):
-    """Stable per-fulfillment credential cache key, with the reason for logs.
+    """Stable per-fulfillment credential cache key.
+
+    Returns (key, legacy_key, kind). `legacy_key` is the pre-namespacing key
+    this ACSM used to map to, or None; see LEGACY_TXN_COMPAT for how it is used.
 
     Priority:
       1. <userId>      Adobe-account files (e.g. Google Play). Kept bare so it
                        still matches seeded rows and groups a user's loans onto
                        one device (respecting providers' per-user device limits).
-      2. <transaction> Fulfillment tokens that carry no userId (e.g. OverDrive).
-                       Stable within a given ACSM and unique per fulfillment, so
-                       a retry reuses the device that already holds the loan
-                       instead of minting a new one (which the provider rejects
-                       with E_LIC_ALREADY_FULFILLED_BY_ANOTHER_USER).
+                       userIds are urn:uuid values, so they need no namespacing.
+      2. <transaction> Fulfillment tokens that carry no userId (e.g. OverDrive),
+                       namespaced by the operator that issued them. Transaction
+                       IDs are operator-scoped counters (small sequential ints),
+                       NOT global identifiers -- two unrelated ACSMs from
+                       different operators really do collide, which pins two
+                       strangers onto one anonymous Adobe device. Hashing
+                       (distributor, operatorURL, transaction, resource) keeps
+                       the key unique per fulfillment while staying stable
+                       across re-downloads of the same loan, so a retry still
+                       reuses the device that already holds it.
       3. sha256(acsm)  Last resort when neither tag is present — still stable
                        per file, so retries stay idempotent without pinning
                        everything to one shared device.
     """
     user_id = _extract_user_id(acsm_bytes)
     if user_id:
-        return user_id, "userId"
-    match = re.search(rb"<transaction>([^<]+)</transaction>", acsm_bytes)
-    if match:
-        return "txn:" + match.group(1).strip().decode("ascii", "ignore"), "transaction"
-    return "acsm:" + hashlib.sha256(acsm_bytes).hexdigest(), "sha256"
+        return user_id, None, "userId"
+    transaction = _extract_tag(acsm_bytes, "transaction")
+    if transaction:
+        operator = _extract_tag(acsm_bytes, "operatorURL") or ""
+        # Host is for human legibility in logs; the digest is what disambiguates.
+        host = urlsplit(operator).hostname or "unknown-operator"
+        scope = "|".join((
+            _extract_tag(acsm_bytes, "distributor") or "",
+            operator,
+            transaction,
+            _extract_tag(acsm_bytes, "resource") or "",
+        ))
+        digest = hashlib.sha256(scope.encode()).hexdigest()[:8]
+        # The "@" is load-bearing: it's what tells namespaced keys apart from
+        # legacy bare ones for the eventual cleanup DELETE.
+        return f"txn:{transaction}@{host}:{digest}", "txn:" + transaction, "transaction"
+    return "acsm:" + hashlib.sha256(acsm_bytes).hexdigest(), None, "sha256"
 
 
 def _caching_enabled():
     return bool(psycopg2 and DATABASE_URL)
 
 
-def load_cached_creds(cache_key):
-    """Return {filename: bytes} for a cached anonymous device, or None."""
+# Backwards compatibility for the legacy bare "txn:<id>" cache key (see
+# _cache_key). While enabled we read the bare key as a fallback, and dual-write
+# it alongside the namespaced key.
+#
+# Rows written before the namespacing fix exist ONLY under the bare key, and a
+# user retrying such a fulfillment still needs to find their device -- minting a
+# fresh one would hand them E_LIC_ALREADY_FULFILLED_BY_ANOTHER_USER. Serving a
+# bare row can still hand over the WRONG device when two operators collide on a
+# transaction ID, but that is exactly the pre-existing behaviour, so the fallback
+# faithfully reproduces today's production semantics rather than regressing
+# anyone mid-retry. Dual-writing additionally keeps a rollback (or a machine
+# still on the previous image mid-deploy) working.
+#
+# A legacy hit is promoted to the namespaced key on the spot (see _do_convert),
+# so every fulfillment seen while this is on ends up with a namespaced row --
+# which is what makes the cleanup below lossless for anything uploaded since.
+#
+# To finish the migration: flip this to False and DEPLOY, then reclaim the rows.
+# Deploy first -- deleting while this is still on just lets the dual-write
+# repopulate bare rows, and the fallback would keep serving them:
+#   DELETE FROM adept_credentials WHERE id LIKE 'txn:%' AND id NOT LIKE '%@%';
+LEGACY_TXN_COMPAT = True
+
+
+def load_cached_creds(cache_key, legacy_key=None):
+    """Return ({filename: bytes}, matched_key) for a cached device, or (None, None).
+
+    Falls back to `legacy_key` while LEGACY_TXN_COMPAT is on. `matched_key` tells
+    the caller which key answered, so a legacy hit can be promoted.
+    """
     if not (_caching_enabled() and cache_key):
-        return None
+        return None, None
     try:
         with closing(psycopg2.connect(DATABASE_URL)) as conn, conn.cursor() as cur:
             cur.execute(
@@ -103,34 +163,53 @@ def load_cached_creds(cache_key):
                 (cache_key,),
             )
             row = cur.fetchone()
+            matched = cache_key
+            if not row and legacy_key and LEGACY_TXN_COMPAT:
+                cur.execute(
+                    "SELECT device_xml, activation_xml, devicesalt "
+                    "FROM adept_credentials WHERE id = %s",
+                    (legacy_key,),
+                )
+                row = cur.fetchone()
+                matched = legacy_key
         if not row:
-            return None
-        return dict(zip(CRED_FILES, (bytes(col) for col in row)))
+            return None, None
+        return dict(zip(CRED_FILES, (bytes(col) for col in row))), matched
     except Exception as e:
         print(f"[creds] cache read failed: {e}", flush=True)
-        return None
+        return None, None
 
 
-def save_cached_creds(cache_key, creds):
-    """Persist freshly activated creds. Best-effort; never raises."""
+def save_cached_creds(cache_key, creds, legacy_key=None):
+    """Persist freshly activated creds. Best-effort; never raises.
+
+    Dual-writes `legacy_key` when given (and LEGACY_TXN_COMPAT is on), so an
+    older image still resolves rows minted by this one. Both rows go in one
+    transaction so they can't diverge.
+    """
     if not (_caching_enabled() and cache_key):
         return
+    keys = [cache_key] + ([legacy_key] if legacy_key and LEGACY_TXN_COMPAT else [])
     try:
         with closing(psycopg2.connect(DATABASE_URL)) as conn:
             with conn, conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO adept_credentials "
-                    "(id, device_xml, activation_xml, devicesalt, created_at) "
-                    "VALUES (%s, %s, %s, %s, NOW()) "
-                    "ON CONFLICT (id) DO NOTHING",
-                    (
-                        cache_key,
-                        psycopg2.Binary(creds["device.xml"]),
-                        psycopg2.Binary(creds["activation.xml"]),
-                        psycopg2.Binary(creds["devicesalt"]),
-                    ),
-                )
-        print(f"[creds] cached credentials for {cache_key}", flush=True)
+                for key in keys:
+                    # DO NOTHING on the legacy key matters: a colliding bare row
+                    # may already belong to someone else's in-flight retry, and
+                    # clobbering it would break them.
+                    cur.execute(
+                        "INSERT INTO adept_credentials "
+                        "(id, device_xml, activation_xml, devicesalt, created_at) "
+                        "VALUES (%s, %s, %s, %s, NOW()) "
+                        "ON CONFLICT (id) DO NOTHING",
+                        (
+                            key,
+                            psycopg2.Binary(creds["device.xml"]),
+                            psycopg2.Binary(creds["activation.xml"]),
+                            psycopg2.Binary(creds["devicesalt"]),
+                        ),
+                    )
+        print(f"[creds] cached credentials for {' + '.join(keys)}", flush=True)
     except Exception as e:
         print(f"[creds] cache write failed: {e}", flush=True)
 
@@ -547,12 +626,21 @@ class ConvertHandler(BaseHTTPRequestHandler):
             # fresh anonymous device on every request (which burns device slots
             # and trips provider device limits). The container owns this cache
             # directly; nothing credential-related travels over the response.
-            cache_key, key_kind = _cache_key(body)
+            cache_key, legacy_key, key_kind = _cache_key(body)
             print(f"[convert] cache_key={cache_key!r} (from {key_kind}) "
-                  f"caching={_caching_enabled()}", flush=True)
-            cached = load_cached_creds(cache_key)
+                  f"legacy_key={legacy_key!r} caching={_caching_enabled()}", flush=True)
+            cached, matched_key = load_cached_creds(cache_key, legacy_key)
             if cached:
-                print(f"[convert] credential cache HIT for {cache_key}", flush=True)
+                print(f"[convert] credential cache HIT for {matched_key}", flush=True)
+                if matched_key != cache_key:
+                    # Answered by the legacy bare key. Copy the device onto the
+                    # namespaced key so this fulfillment survives the eventual
+                    # cleanup of legacy rows -- otherwise it would only ever
+                    # exist under a key we're about to delete. Writing the same
+                    # device it just used is also the only correct choice: the
+                    # loan is bound to that device, so retries must reuse it.
+                    print(f"[convert] promoting {matched_key} -> {cache_key}", flush=True)
+                    save_cached_creds(cache_key, cached)
                 self._send_event({"type": "status", "stage": "hydrate",
                                   "message": "Loading cached credentials"})
                 os.makedirs(ADEPT_DIR, exist_ok=True)
@@ -573,7 +661,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 for name in CRED_FILES:
                     with open(os.path.join(ADEPT_DIR, name), "rb") as f:
                         fresh[name] = f.read()
-                save_cached_creds(cache_key, fresh)
+                save_cached_creds(cache_key, fresh, legacy_key)
 
             self._send_event({"type": "status", "stage": "download",
                               "message": "Downloading encrypted file"})
