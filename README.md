@@ -1,3 +1,5 @@
+
+
 # ACSM Converter
 
 A web app that converts ACSM files to standard EPUB/PDF files, powered by [libgourou](https://forge.soutade.fr/soutade/libgourou). A [Cloudflare Worker](https://developers.cloudflare.com/workers/) serves the UI and proxies to a converter running on [Fly.io](https://fly.io/).
@@ -56,7 +58,8 @@ Caching is optional — if `DATABASE_URL` is unset the converter still works, bu
 
 ```bash
 flyctl launch --no-deploy   # accept the existing fly.toml; pick an app name + region
-flyctl secrets set AUTH_TOKEN=$(openssl rand -hex 32)
+AUTH_TOKEN=$(openssl rand -hex 32)
+flyctl secrets set AUTH_TOKEN="$AUTH_TOKEN"
 flyctl secrets set DATABASE_URL="postgres://…"   # from step 1
 flyctl deploy
 ```
