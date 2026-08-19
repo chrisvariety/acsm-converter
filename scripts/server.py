@@ -23,6 +23,15 @@ except ImportError:  # caching is optional; server still runs without it
 
 _convert_lock = threading.Lock()
 
+# Set once a shutdown signal arrives: stop taking new work, let the conversion
+# already in flight finish. Fly sends kill_signal (SIGINT by default) and
+# SIGKILLs us kill_timeout later; without a handler Python dies instantly and
+# takes acsmdownloader/adept_remove with it. That is not a recoverable failure
+# -- a kill during fulfillment burns the single-use Adobe token (see the
+# DOWNLOAD_TIMEOUT note below), permanently bricking that ACSM. So we drain.
+_draining = threading.Event()
+_server = None
+
 ADEPT_DIR = "/home/libgourou/.adept"
 WORK_DIR = "/home/libgourou/work"
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
@@ -48,6 +57,15 @@ DOWNLOAD_TIMEOUT = 600
 # would just move the same failure one step later -- and by this point the
 # fulfillment token is already spent, so timing out is equally unrecoverable.
 DECRYPT_TIMEOUT = 480
+# How long to wait for an in-flight conversion at shutdown. Kept just under
+# kill_timeout in fly.toml -- Fly SIGKILLs us at that deadline regardless, so
+# leave a little room to log and exit cleanly. Conversions longer than this
+# still lose (worst case is DOWNLOAD_TIMEOUT + DECRYPT_TIMEOUT, well past any
+# allowed kill_timeout), but it covers the large majority of them.
+DRAIN_TIMEOUT = 285
+# Grace after the lock frees, so the last of the result body reaches the client
+# before the interpreter exits and kills the (daemon) handler thread.
+DRAIN_GRACE = 2
 # How often to emit a keep-alive status event during a long-running step, so
 # the CDN doesn't sever the (otherwise silent) connection mid-download.
 HEARTBEAT_INTERVAL = 15
@@ -478,7 +496,11 @@ def _match_known_error(output):
 class ConvertHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
-            self._json_response(200, {"status": "ok"})
+            if _draining.is_set():
+                # Fail the check so the proxy stops routing here while we drain.
+                self._json_response(503, {"status": "draining"})
+            else:
+                self._json_response(200, {"status": "ok"})
             return
         self.send_response(404)
         self.end_headers()
@@ -487,6 +509,13 @@ class ConvertHandler(BaseHTTPRequestHandler):
         if self.path != "/convert":
             self.send_response(404)
             self.end_headers()
+            return
+
+        if _draining.is_set():
+            # Shutting down: refuse rather than start a fulfillment we cannot
+            # finish, since a kill mid-download burns the ACSM. Under bluegreen
+            # a fresh machine is already serving, so the client can just retry.
+            self._json_response(503, {"error": "Server is shutting down; please retry"})
             return
 
         if AUTH_TOKEN:
@@ -795,9 +824,54 @@ class ConvertHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _handle_shutdown(signum, _frame):
+    """Start draining. Runs on the main thread, interrupting serve_forever()."""
+    if _draining.is_set():
+        return  # already draining; ignore repeats
+    _draining.set()
+    print(f"[drain] {_signal_name(-signum)} received; refusing new conversions",
+          flush=True)
+    # Keep serving while we drain: /health now answers 503 and /convert is
+    # refused, so the proxy sees us go unhealthy promptly. Stopping the accept
+    # loop here instead would leave both endpoints hanging until the socket
+    # closed, which reads as a timeout rather than a clean "not me". The drain
+    # runs off-thread because shutdown() must not be called from the thread
+    # running serve_forever() -- it waits for that loop to exit.
+    threading.Thread(target=_drain_then_stop, daemon=True).start()
+
+
+def _drain_then_stop():
+    """Let the in-flight conversion finish, then stop the accept loop."""
+    _drain()
+    _server.shutdown()
+
+
+def _drain():
+    """Wait for the in-flight conversion, if any, to finish.
+
+    Acquiring the lock means no conversion is running. Handler threads are
+    daemons, so exiting the interpreter would kill a running acsmdownloader
+    mid-fulfillment -- exactly the unrecoverable case we are avoiding.
+    """
+    start = time.monotonic()
+    if _convert_lock.acquire(timeout=DRAIN_TIMEOUT):
+        _convert_lock.release()
+        print(f"[drain] idle after {time.monotonic() - start:.0f}s; exiting",
+              flush=True)
+        time.sleep(DRAIN_GRACE)
+    else:
+        print(f"[drain] conversion still in flight after {DRAIN_TIMEOUT}s; "
+              f"exiting anyway before Fly SIGKILLs us", flush=True)
+
+
 if __name__ == "__main__":
     os.makedirs(WORK_DIR, exist_ok=True)
     os.makedirs(ADEPT_DIR, exist_ok=True)
-    server = ThreadingHTTPServer(("0.0.0.0", 8080), ConvertHandler)
-    print("Server listening on port 8080")
-    server.serve_forever()
+    _server = ThreadingHTTPServer(("0.0.0.0", 8080), ConvertHandler)
+    # Fly's default kill_signal is SIGINT; take SIGTERM too so the drain runs
+    # however we're stopped.
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    print("Server listening on port 8080", flush=True)
+    _server.serve_forever()  # returns once _drain_then_stop calls shutdown()
+    print("[drain] accept loop stopped; exiting", flush=True)

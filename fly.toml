@@ -6,6 +6,37 @@
 app = 'acsm-converter-fly'
 primary_region = 'sjc'
 
+# adept_remove buffers the whole decrypted book in RAM: libgourou hands every
+# rewritten zip entry to libzip as a zip_source_buffer and nothing is flushed
+# until zip_close, so peak RSS tracks book size (250-350MB observed). At 512MB
+# the kernel OOM-killed it 109 times between Aug 11-19 2026, reaching users as
+# "Internal failure (SIGKILL)", rc=-9. Swap is a safety net, not a fix: a kill
+# mid-pipeline burns the single-use fulfillment token, so paging beats dying.
+swap_size_mb = 512
+
+# Give the drain handler in server.py room to let an in-flight conversion
+# finish before Fly SIGKILLs the machine. 5m is the platform maximum; server.py
+# budgets DRAIN_TIMEOUT just under it.
+kill_timeout = '5m'
+
+[deploy]
+  # Boot the replacement and wait for its health check before cutting traffic,
+  # so a deploy never leaves /convert with no healthy machine. Eligible here:
+  # there is a health check and no attached volumes.
+  strategy = 'bluegreen'
+
+[env]
+  # The server leaked ~12MB/day of RSS (65MB on Aug 11 -> 169MB on Aug 19),
+  # squeezing adept_remove's headroom until the OOM killer took it: victim size
+  # at kill fell 332MB -> 233MB over the same window, with the two summing to a
+  # near-constant ~397MB anon ceiling. Not Python objects -- /proc/PID/smaps
+  # showed ~7 glibc secondary arenas at 64MB-aligned addresses holding 10-30MB
+  # of dirty, never-returned memory each. ThreadingHTTPServer makes a thread per
+  # request and glibc allows 8 x ncores arenas, so they accumulate. Capping at 2
+  # bounds that; conversions are serialised by _convert_lock anyway, so the
+  # reduced per-thread malloc concurrency costs us nothing.
+  MALLOC_ARENA_MAX = '2'
+
 [build]
   dockerfile = 'Dockerfile'
 
@@ -26,4 +57,4 @@ primary_region = 'sjc'
 [[vm]]
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 512
+  memory_mb = 2048
