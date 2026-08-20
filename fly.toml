@@ -8,13 +8,15 @@ primary_region = 'sjc'
 
 # adept_remove buffers the whole decrypted book in RAM: libgourou hands every
 # rewritten zip entry to libzip as a zip_source_buffer and nothing is flushed
-# until zip_close, so peak RSS tracks book size (250-350MB observed). At 512MB
+# until zip_close, so peak RSS tracks book size (250-350MB observed). This is
+# also why server.py still runs adept_remove strictly one at a time even
+# though downloads are now concurrent. At 512MB
 # the kernel OOM-killed it 109 times between Aug 11-19 2026, reaching users as
 # "Internal failure (SIGKILL)", rc=-9. Swap is a safety net, not a fix: a kill
 # mid-pipeline burns the single-use fulfillment token, so paging beats dying.
 swap_size_mb = 512
 
-# Give the drain handler in server.py room to let an in-flight conversion
+# Give the drain handler in server.py room to let in-flight conversions
 # finish before Fly SIGKILLs the machine. 5m is the platform maximum; server.py
 # budgets DRAIN_TIMEOUT just under it.
 kill_timeout = '5m'
@@ -33,8 +35,10 @@ kill_timeout = '5m'
   # showed ~7 glibc secondary arenas at 64MB-aligned addresses holding 10-30MB
   # of dirty, never-returned memory each. ThreadingHTTPServer makes a thread per
   # request and glibc allows 8 x ncores arenas, so they accumulate. Capping at 2
-  # bounds that; conversions are serialised by _convert_lock anyway, so the
-  # reduced per-thread malloc concurrency costs us nothing.
+  # bounds that. The handler threads only shuffle bytes -- every expensive
+  # step runs in a subprocess with its own address space -- so the reduced
+  # per-thread malloc concurrency costs us nothing even now that downloads
+  # run several at a time (MAX_CONCURRENT_DOWNLOADS in server.py).
   MALLOC_ARENA_MAX = '2'
 
 [build]
@@ -45,7 +49,28 @@ kill_timeout = '5m'
   force_https = true
   auto_stop_machines = 'stop'
   auto_start_machines = true
+  # The second machine is left stopped while idle and auto-started once the
+  # first one passes its soft_limit below. Conversions take minutes, so the
+  # boot + health-check delay is noise; raise this to 2 to trade idle cost for
+  # instant burst capacity.
   min_machines_running = 1
+
+  # Without this block Fly defaults to a soft_limit of 20, which at our traffic
+  # means a second machine would never be preferred (or auto-started) -- every
+  # conversion would pile onto one machine while the other sat idle. A
+  # conversion holds one request open for its whole duration, and the server
+  # answers with `Connection: close`, so in-flight requests are a direct proxy
+  # for load here.
+  #
+  # soft_limit matches MAX_CONCURRENT_DOWNLOADS: once a machine has a full set
+  # of downloads running, send new work elsewhere. hard_limit stays well above
+  # it on purpose -- past hard_limit the proxy refuses outright, and queueing
+  # in-app (where the client gets "waiting" events with a queue position) is a
+  # much better experience than a bare 503.
+  [http_service.concurrency]
+    type = 'requests'
+    soft_limit = 4
+    hard_limit = 20
 
   [[http_service.checks]]
     interval = '30s'

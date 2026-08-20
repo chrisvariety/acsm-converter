@@ -134,9 +134,17 @@ const HTML = `<!DOCTYPE html>
             case "queued":
               setStatus("Queued...");
               break;
-            case "waiting":
-              setStatus("Waiting in queue (" + event.seconds_waited + "s)...");
+            case "waiting": {
+              // Two separate queues now: downloads run several at a time,
+              // DRM removal is strictly one at a time. Both send the same
+              // event shape, so a missing stage/position stays harmless.
+              var where = event.stage === "decrypt"
+                ? "Waiting to finalize"
+                : "Waiting in queue";
+              var pos = event.queue_position ? " #" + event.queue_position : "";
+              setStatus(where + pos + " (" + event.seconds_waited + "s)...");
               break;
+            }
             case "status":
               setStatus(STAGE_LABELS[event.stage] || event.message || "Working...");
               break;

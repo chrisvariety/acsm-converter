@@ -11,6 +11,32 @@ A web app that converts ACSM files to standard EPUB/PDF files, powered by [libgo
 
 The converter owns the credential cache directly (it reads and writes Postgres), so the Worker never sees or handles credentials — it's a transparent proxy.
 
+## Concurrency
+
+Within a machine, the two expensive stages are limited separately:
+
+| Stage | Limit | Why |
+| --- | --- | --- |
+| `acsmdownloader` (fulfill + download) | `MAX_CONCURRENT_DOWNLOADS`, default 4 | Network-bound and streamed straight to disk, so it costs almost no memory and spends its time waiting on the provider. Running these one at a time meant a single slow provider stalled everyone behind it. |
+| `adept_remove` (DRM removal) | 1, not configurable | Buffers the whole decrypted book in RAM (250–350MB); two at once risks an OOM kill, which burns the single-use fulfillment token. It's also pure local crypto on one shared vCPU, so parallelism would buy nothing. |
+
+Each request gets its own `.adept` credential directory inside its work dir, which is what makes running several at once safe — the tools all take a directory argument. Requests waiting for a slot get `{"type":"waiting"}` events carrying the stage and their queue position.
+
+### Scaling out
+
+Because DRM removal is serialized per machine, overall throughput is capped at roughly one book per `adept_remove` run — and the only way past that is more machines:
+
+```bash
+flyctl scale count 2
+```
+
+Two things make that safe rather than just parallel:
+
+- **`[http_service.concurrency]` in `fly.toml`.** Fly's default `soft_limit` of 20 is far above real load here, so without it every conversion lands on one machine while the other stays stopped. The configured `soft_limit` matches `MAX_CONCURRENT_DOWNLOADS`.
+- **`claim_cached_creds` in `server.py`.** Two machines can miss the credential cache for the same key at the same moment and each activate a device. Only one wins the row, and the loser must then *fulfill with the winner's device* — otherwise a retry reads the cached device, fulfills from a different one, and the provider answers `E_LIC_ALREADY_FULFILLED_BY_ANOTHER_USER`, permanently bricking that ACSM. The in-process lock around activation is only a same-machine optimization; this is the part that actually holds across machines.
+
+Machines drain on shutdown (see `kill_timeout` and `DRAIN_TIMEOUT`), so scaling down or redeploying won't kill a conversion mid-fulfillment.
+
 ## Project structure
 
 ```
@@ -60,6 +86,8 @@ flyctl secrets set AUTH_TOKEN=$(openssl rand -hex 32)
 flyctl secrets set DATABASE_URL="postgres://…"   # from step 1
 flyctl deploy
 ```
+
+To change how many downloads run at once, set `MAX_CONCURRENT_DOWNLOADS` in the `[env]` block of `fly.toml` (default 4). Raising it costs disk — each in-flight conversion holds an encrypted and a decrypted copy of its book — and makes more parallel requests to the same provider from a single egress IP.
 
 Note the public URL (e.g. `https://your-app.fly.dev`) and the `AUTH_TOKEN` value.
 
