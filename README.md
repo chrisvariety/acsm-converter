@@ -7,7 +7,7 @@ A web app that converts ACSM files to standard EPUB/PDF files, powered by [libgo
 1. User uploads an `.acsm` file through the web interface
 2. The Worker forwards the file, unchanged, to the converter on Fly.io and streams the response back to the browser
 3. The converter looks up cached Adobe credentials for the file's `userId` in Postgres (activating a fresh anonymous device and caching it if there's no hit), downloads the book, and converts it to the final EPUB/PDF
-4. Progress and the final EPUB/PDF are streamed back as newline-delimited JSON (NDJSON) events
+4. Progress is streamed back as newline-delimited JSON (NDJSON) events, and the finished EPUB/PDF follows the terminal `result` event as raw bytes on the same connection
 
 The converter manages the credential cache by reading from and writing to Postgres. This means the Worker does not see or handle credentials because it functions as a transparent proxy.
 

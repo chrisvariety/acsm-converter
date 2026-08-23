@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """HTTP server for ACSM-to-EPUB/PDF conversion using libgourou tools."""
 
-import base64
 import collections
 import hashlib
 import json
@@ -67,8 +66,7 @@ DRAIN_GRACE = 2
 # How often to emit a keep-alive status event during a long-running step, so
 # the CDN doesn't sever the (otherwise silent) connection mid-download.
 HEARTBEAT_INTERVAL = 15
-# Read size when streaming the result to the client. A multiple of 3 so each
-# chunk base64-encodes cleanly (padding only ever appears at the true end).
+# Read size when streaming the result body to the client.
 RESULT_CHUNK = 3 * 1024 * 1024
 # How often a queued request emits a "waiting" event. Doubles as the keep-alive
 # for a connection that has nothing else to say yet.
@@ -856,8 +854,9 @@ class ConvertHandler(BaseHTTPRequestHandler):
             elif e.returncode is not None and e.returncode < 0:
                 # Killed by a signal — empty stdout/stderr is typical.
                 # Render a structured "internal failure" card so the user gets
-                # retry guidance instead of a raw blob, and include returncode/signal
-                # for power users reading NDJSON.
+                # retry guidance instead of a raw blob, and include
+                # returncode/signal: the page keeps every event line and shows
+                # them under "Show log", so those land in the bug report.
                 self._send_event({
                     "type": "error",
                     **SIGNAL_GUIDANCE,
@@ -1034,35 +1033,36 @@ class ConvertHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _send_file_result(self, filename, content_type, path):
-        """Stream the terminal result event, base64-encoding the file from disk
-        in chunks so we never hold the whole (100+ MB) payload in memory.
+        """Emit the terminal `result` event, then the file's raw bytes to end of
+        stream.
 
-        The wire format is unchanged: a single NDJSON line holding a JSON object
-        with a `data_base64` field. We let json.dumps build (and escape) the
-        envelope with an empty payload, then split it just inside the opening
-        quote of data_base64 and stream the base64 into the gap. base64 emits no
-        newlines, so the line stays valid NDJSON and the client parser is
-        untouched.
+        The payload used to ride inside that event as base64. Streaming the
+        encode from disk kept *our* memory flat, but it made the browser
+        materialise the book several times over: a 335MB epub became a 447MB
+        NDJSON line, which the client accumulated into a string, copied into its
+        event log, copied again out of JSON.parse, atob'd, and finally walked
+        byte by byte into a Uint8Array. Peak heap ran past 2GB, the tab was
+        killed mid-download, and the user saw the page "refresh" with no error to
+        report (the log died with the tab). Books over ~250MB never once made it
+        through. Handing over raw bytes lets the client push each chunk straight
+        into a Blob, which browsers spill to disk, and drops 25% off the wire.
+
+        The bytes can simply run to end of stream: /convert answers with
+        `Connection: close` and no Content-Length, so the connection close is
+        already what delimits the body. `size` is what lets the client tell a
+        complete download from a truncated one -- without it a dropped
+        connection would silently save a corrupt book, which is a worse failure
+        than the crash this replaces.
         """
-        self._terminal_sent = True
         self._stage = "result upload"
-        envelope = json.dumps({
+        self._send_event({
             "type": "result",
             "filename": filename,
             "content_type": content_type,
-            "data_base64": "",
+            "size": os.path.getsize(path),
         })
-        # Empty payload renders as `…"data_base64": ""}`. Drop the closing `"}`
-        # to leave the opening quote open, stream the value, then close it.
-        assert envelope.endswith('""}'), envelope
-        self.wfile.write(envelope[:-2].encode())
         with open(path, "rb") as f:
-            while True:
-                chunk = f.read(RESULT_CHUNK)
-                if not chunk:
-                    break
-                self.wfile.write(base64.b64encode(chunk))
-        self.wfile.write(b'"}\n')
+            shutil.copyfileobj(f, self.wfile, RESULT_CHUNK)
         self.wfile.flush()
 
     def _safe_terminal_event(self, event):

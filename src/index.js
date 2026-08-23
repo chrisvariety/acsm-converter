@@ -129,7 +129,7 @@ const HTML = `<!DOCTYPE html>
 
         let resultEvent = null;
         let errorEvent = null;
-        await readNdjson(resp.body, (event) => {
+        const payload = await readStream(resp.body, (event) => {
           switch (event.type) {
             case "queued":
               setStatus("Queued...");
@@ -158,14 +158,30 @@ const HTML = `<!DOCTYPE html>
         });
 
         if (resultEvent) {
-          const bytes = base64ToBytes(resultEvent.data_base64);
-          const blob = new Blob([bytes], { type: resultEvent.content_type });
+          // The stream is delimited by connection close, so a drop mid-transfer
+          // looks exactly like a clean end. Without this check we would hand the
+          // user a truncated file that opens as a corrupt book.
+          const got = payload ? payload.received : 0;
+          if (got !== resultEvent.size) {
+            showPlainError(
+              "Download incomplete: received " + got + " of " + resultEvent.size +
+              " bytes. The connection dropped before the whole book arrived. " +
+              "Please try converting the same file again.");
+            return;
+          }
+          const blob = new Blob(payload.parts, { type: resultEvent.content_type });
+          // Drop our references now the Blob owns the data; large blobs are
+          // backed by disk, so this is what keeps the JS heap flat.
+          payload.parts.length = 0;
           const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
           a.href = url;
           a.download = resultEvent.filename || "output.epub";
           a.click();
-          URL.revokeObjectURL(url);
+          // Revoking straight after click() races the start of the download on
+          // a multi-hundred-MB blob, which is exactly the size we are here to
+          // support. Hold the URL long enough for the browser to take it.
+          setTimeout(() => URL.revokeObjectURL(url), 60000);
           setStatus("Done! Your file is downloading.");
         } else if (errorEvent) {
           if (errorEvent.error_code) {
@@ -184,30 +200,79 @@ const HTML = `<!DOCTYPE html>
       }
     });
 
-    async function readNdjson(body, onEvent) {
+    // Reads the response: NDJSON progress events, then -- once the terminal
+    // "result" event arrives -- every remaining byte as the file itself.
+    // Returns {parts, received} for the payload, or null if no result was sent.
+    //
+    // This walks raw bytes rather than a decoded string for two reasons. The
+    // payload is binary now, so a TextDecoder over it would corrupt it. And the
+    // old string version was quadratic: it appended every chunk to one buffer
+    // and called indexOf("\\n") on the whole thing per read, so the single huge
+    // result line made it rescan ~1.5TB before it even ran out of memory. Here
+    // the line buffer only ever holds small event lines.
+    async function readStream(body, onEvent) {
       const reader = body.getReader();
       const decoder = new TextDecoder();
-      let buffer = "";
-      while (true) {
+      let pending = new Uint8Array(0);
+      let parts = null;          // non-null once we are past the result event
+      let received = 0;
+
+      for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buffer.indexOf("\\n")) >= 0) {
-          const line = buffer.slice(0, idx).trim();
-          buffer = buffer.slice(idx + 1);
+
+        if (parts) {
+          parts.push(value);
+          received += value.byteLength;
+          continue;
+        }
+
+        pending = concatBytes(pending, value);
+        let start = 0;
+        for (;;) {
+          const nl = pending.indexOf(10, start);   // "\\n"
+          if (nl < 0) break;
+          const line = decoder.decode(pending.subarray(start, nl)).trim();
+          start = nl + 1;
           if (!line) continue;
           eventLog.push(line);
-          try { onEvent(JSON.parse(line)); } catch (_) {}
+          let event = null;
+          try {
+            event = JSON.parse(line);
+            onEvent(event);
+          } catch (_) {
+            // A malformed line, or a status handler that threw, must not abort
+            // a transfer that is otherwise fine. If the line did parse we still
+            // act on it below -- only the display side is skipped.
+          }
+          if (!event) continue;
+          if (event.type === "result") {
+            // Everything after this line is the book. Take whatever of it
+            // already landed in this chunk and switch to binary mode.
+            const rest = pending.subarray(start);
+            parts = [];
+            if (rest.byteLength) {
+              parts.push(rest.slice());
+              received += rest.byteLength;
+            }
+            break;
+          }
+        }
+        if (parts) {
+          pending = null;
+        } else {
+          pending = pending.slice(start);
         }
       }
+      return parts ? { parts: parts, received: received } : null;
     }
 
-    function base64ToBytes(b64) {
-      const binary = atob(b64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      return bytes;
+    function concatBytes(a, b) {
+      if (!a.byteLength) return b;
+      const out = new Uint8Array(a.byteLength + b.byteLength);
+      out.set(a, 0);
+      out.set(b, a.byteLength);
+      return out;
     }
 
     function setStatus(msg) {
