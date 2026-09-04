@@ -672,6 +672,24 @@ def _match_known_error(output):
     return None, None
 
 
+def _download_name(filename):
+    """A name the browser can sensibly save the book under.
+
+    Deliberately separate from the name on disk. That one is built by
+    acsmdownloader from the book's `dc:title` and is whatever the fulfilment
+    metadata happened to hold -- one real ACSM yielded a title of "   .     ",
+    so the file was literally "   .     .epub". Names like that are fine for
+    our own file I/O and useless to a user, so the on-disk name stays verbatim
+    everywhere we touch the filesystem and this is only ever the label in the
+    `result` event.
+    """
+    ext = ".pdf" if filename.lower().endswith(".pdf") else ".epub"
+    stem = filename[:-len(ext)] if filename.lower().endswith(ext) else filename
+    stem = re.sub(r"[\x00-\x1f\x7f/\\]", " ", stem)  # control chars, separators
+    stem = re.sub(r"\s+", " ", stem).strip(" .")
+    return (stem[:120].strip(" .") or "book") + ext
+
+
 class ConvertHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
@@ -797,13 +815,29 @@ class ConvertHandler(BaseHTTPRequestHandler):
             # Download slot released: whoever is next starts fetching now,
             # rather than waiting on the decrypt below.
 
-            # acsmdownloader prints lines like "Created File Name.epub" — first
-            # token is a status prefix, remainder is the filename.
+            # acsmdownloader announces what it wrote as `Created <name>`
+            # (acsmdownloader.cpp:119). Everything after that marker is the
+            # name, and it is taken verbatim: it comes from the book's
+            # `dc:title`, so it can legitimately begin or end with spaces.
+            # Stripping it is what broke a title of "   .     " -- we went
+            # looking for ".     .epub" while the file on disk was
+            # "   .     .epub", then handed the missing path to adept_remove,
+            # whose fileCopy() tests `!fd` against an open() that returns -1 on
+            # failure. So it copied nothing, left an empty file, and libzip
+            # rejected it: "Invalid zip file <output>", pointing at the output
+            # for a fault in the input.
+            #
+            # The marker is searched for anywhere in the line rather than
+            # anchored, because libgourou draws its progress meter with a
+            # leading \r and no trailing newline (drmprocessorclientimpl.cpp:164).
+            # It does emit one endl when the transfer ends, so today `Created`
+            # starts its own line -- but a run that skips that endl would
+            # otherwise glue "Download 100%" to the front of the name.
             output_filename = None
-            for line in (result.stdout + result.stderr).splitlines():
-                if re.search(r"\.(epub|pdf)\b", line, re.IGNORECASE):
-                    parts = line.strip().split(" ", 1)
-                    output_filename = parts[1].strip() if len(parts) == 2 else parts[0].strip()
+            for line in result.stdout.splitlines():
+                _, marker, name = line.partition("Created ")
+                if marker and name.lower().endswith((".epub", ".pdf")):
+                    output_filename = name
                     break
 
             if not output_filename:
@@ -816,8 +850,23 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 return
 
             encrypted_path = os.path.join(work_dir, output_filename)
+            if not os.path.exists(encrypted_path):
+                # The name we read back no longer matches what is on disk.
+                # Stop here: passing a missing path to adept_remove reports
+                # "Invalid zip file <output>" instead, which sends anyone
+                # reading the log after the wrong file entirely.
+                print(f"[convert] ERROR: parsed {output_filename!r} but no such file "
+                      f"in {work_dir}: {os.listdir(work_dir)}", flush=True)
+                self._send_event({
+                    "type": "error",
+                    "error": "Downloaded file not found",
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                })
+                return
+
             decrypted_path = os.path.join(work_dir, "decrypted_" + output_filename)
-            enc_size = os.path.getsize(encrypted_path) if os.path.exists(encrypted_path) else -1
+            enc_size = os.path.getsize(encrypted_path)
             print(f"[convert] downloaded {output_filename!r} ({enc_size} bytes); removing DRM",
                   flush=True)
 
@@ -835,9 +884,11 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 "application/epub+zip" if output_filename.lower().endswith(".epub")
                 else "application/pdf"
             )
+            download_name = _download_name(output_filename)
             out_size = os.path.getsize(decrypted_path)
-            print(f"[convert] Success! Returning {output_filename} ({out_size} bytes)", flush=True)
-            self._send_file_result(output_filename, content_type, decrypted_path)
+            print(f"[convert] Success! Returning {download_name!r} "
+                  f"(on disk {output_filename!r}, {out_size} bytes)", flush=True)
+            self._send_file_result(download_name, content_type, decrypted_path)
 
         except subprocess.CalledProcessError as e:
             output = (e.stdout or "") + (e.stderr or "")
