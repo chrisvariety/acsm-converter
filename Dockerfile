@@ -32,6 +32,7 @@ COPY --from=builder /usr/src/libgourou/utils/acsmdownloader \
                     /usr/local/bin/
 
 RUN apt-get update && \
+  DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && \
   DEBIAN_FRONTEND=noninteractive TZ="America/Los_Angeles" \
   apt-get install -y \
   python3 \
