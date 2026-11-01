@@ -1,4 +1,4 @@
-const HTML = `<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -190,7 +190,7 @@ const HTML = `<!DOCTYPE html>
             const parts = [errorEvent.error || "Conversion failed"];
             if (errorEvent.stdout) parts.push("stdout: " + errorEvent.stdout);
             if (errorEvent.stderr) parts.push("stderr: " + errorEvent.stderr);
-            showPlainError(parts.join("\\n"));
+            showPlainError(parts.join("\n"));
           }
         } else {
           showPlainError("Conversion ended without a result.");
@@ -207,7 +207,7 @@ const HTML = `<!DOCTYPE html>
     // This walks raw bytes rather than a decoded string for two reasons. The
     // payload is binary now, so a TextDecoder over it would corrupt it. And the
     // old string version was quadratic: it appended every chunk to one buffer
-    // and called indexOf("\\n") on the whole thing per read, so the single huge
+    // and called indexOf("\n") on the whole thing per read, so the single huge
     // result line made it rescan ~1.5TB before it even ran out of memory. Here
     // the line buffer only ever holds small event lines.
     async function readStream(body, onEvent) {
@@ -230,7 +230,7 @@ const HTML = `<!DOCTYPE html>
         pending = concatBytes(pending, value);
         let start = 0;
         for (;;) {
-          const nl = pending.indexOf(10, start);   // "\\n"
+          const nl = pending.indexOf(10, start);   // "\n"
           if (nl < 0) break;
           const line = decoder.decode(pending.subarray(start, nl)).trim();
           start = nl + 1;
@@ -317,7 +317,7 @@ const HTML = `<!DOCTYPE html>
         const pre = document.createElement("pre");
         pre.className = "log-output";
         pre.style.display = "none";
-        pre.textContent = eventLog.join("\\n");
+        pre.textContent = eventLog.join("\n");
 
         btn.addEventListener("click", () => {
           const hidden = pre.style.display === "none";
@@ -363,50 +363,4 @@ const HTML = `<!DOCTYPE html>
     }
   </script>
 </body>
-</html>`;
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/" && request.method === "GET") {
-      return new Response(HTML, {
-        headers: { "Content-Type": "text/html" },
-      });
-    }
-
-    if (url.pathname === "/convert" && request.method === "POST") {
-      const body = await request.arrayBuffer();
-
-      if (!body.byteLength) {
-        return Response.json({ error: "No file uploaded" }, { status: 400 });
-      }
-
-      // Transparent proxy to the converter. The container owns the full
-      // credential lifecycle (it persists to Postgres directly), so the
-      // Worker has nothing to inspect — it just relays the NDJSON stream.
-      const upstream = await fetch(
-        "https://acsm-converter-fly.fly.dev/convert",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/octet-stream",
-            Authorization: `Bearer ${env.FLY_AUTH_TOKEN}`,
-          },
-          body,
-        },
-      );
-
-      return new Response(upstream.body, {
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers: {
-          "Content-Type":
-            upstream.headers.get("Content-Type") || "application/x-ndjson",
-        },
-      });
-    }
-
-    return new Response("Not found", { status: 404 });
-  },
-};
+</html>

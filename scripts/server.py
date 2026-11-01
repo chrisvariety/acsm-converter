@@ -31,8 +31,16 @@ _draining = threading.Event()
 _server = None
 
 WORK_DIR = "/home/libgourou/work"
-AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# The upload page, served at GET /. Read once at startup: it only changes on deploy.
+INDEX_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+with open(INDEX_HTML_PATH, "rb") as _f:
+    INDEX_HTML = _f.read()
+
+# The bare domain only redirects, so every visitor ends up on one canonical host.
+APEX_HOST = "acsm-converter.com"
+CANONICAL_ORIGIN = "https://www.acsm-converter.com"
 
 CRED_FILES = ("device.xml", "activation.xml", "devicesalt")
 
@@ -692,6 +700,22 @@ def _download_name(filename):
 
 class ConvertHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        host = self.headers.get("Host", "").split(":")[0].lower()
+        if host == APEX_HOST:
+            self.send_response(301)
+            self.send_header("Location", CANONICAL_ORIGIN + self.path)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path.split("?")[0] == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(INDEX_HTML)))
+            # revalidate every visit so a deploy reaches users immediately
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(INDEX_HTML)
+            return
         if self.path == "/health":
             if _draining.is_set():
                 # Fail the check so the proxy stops routing here while we drain.
@@ -714,12 +738,6 @@ class ConvertHandler(BaseHTTPRequestHandler):
             # a fresh machine is already serving, so the client can just retry.
             self._json_response(503, {"error": "Server is shutting down; please retry"})
             return
-
-        if AUTH_TOKEN:
-            auth = self.headers.get("Authorization", "")
-            if auth != f"Bearer {AUTH_TOKEN}":
-                self._json_response(401, {"error": "Unauthorized"})
-                return
 
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:

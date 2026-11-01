@@ -44,7 +44,7 @@ RUN apt-get update && \
   && apt-get autoclean \
   && rm -rf /var/lib/apt/lists/*
 
-COPY scripts/server.py /home/libgourou/server.py
+COPY scripts/server.py scripts/index.html /home/libgourou/
 WORKDIR /home/libgourou
 
 EXPOSE 8080

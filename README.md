@@ -1,45 +1,37 @@
 # ACSM Converter
 
-A web app that converts ACSM files to standard EPUB/PDF files, powered by [libgourou](https://forge.soutade.fr/soutade/libgourou). A [Cloudflare Worker](https://developers.cloudflare.com/workers/) serves the UI and proxies to a converter running on [Fly.io](https://fly.io/).
+A web app that converts ACSM files to standard EPUB/PDF files, powered by [libgourou](https://forge.soutade.fr/soutade/libgourou). It runs entirely on [Fly.io](https://fly.io/): one small Python server serves the upload page and does the conversion.
 
 ## How it works
 
 1. User uploads an `.acsm` file through the web interface
-2. The Worker forwards the file, unchanged, to the converter on Fly.io and streams the response back to the browser
-3. The converter looks up cached Adobe credentials for the file's `userId` in Postgres (activating a fresh anonymous device and caching it if there's no hit), downloads the book, and converts it to the final EPUB/PDF
-4. Progress is streamed back as newline-delimited JSON (NDJSON) events, and the finished EPUB/PDF follows the terminal `result` event as raw bytes on the same connection
+2. The converter looks up cached Adobe credentials for the file's `userId` in Postgres (activating a fresh anonymous device and caching it if there's no hit), downloads the book, and converts it to the final EPUB/PDF
+3. Progress is streamed back as newline-delimited JSON (NDJSON) events, and the finished EPUB/PDF follows the terminal `result` event as raw bytes on the same connection
 
-The converter manages the credential cache by reading from and writing to Postgres. This means the Worker does not see or handle credentials because it functions as a transparent proxy.
+The converter manages the credential cache by reading from and writing to Postgres.
 
 ## Project structure
 
 ```
-src/index.js       # Cloudflare Worker - serves the UI and proxies to Fly.io
-scripts/server.py  # Python HTTP server running inside the container
+scripts/server.py  # Python HTTP server: serves the page, runs conversions
+scripts/index.html # The upload page (served at /)
 scripts/schema.sql # Postgres schema for the credential cache
 Dockerfile         # Builds libgourou tools + the HTTP server
-wrangler.jsonc     # Cloudflare Worker configuration
-fly.toml           # Fly.io configuration (the converter backend)
+fly.toml           # Fly.io configuration
 ```
 
 ## Development
 
 ```bash
-npm install
-npm run dev
+docker build -t acsm-converter .
+docker run --rm -p 8080:8080 acsm-converter
 ```
+
+Then open http://localhost:8080.
 
 ## Deployment
 
-```bash
-npm run deploy
-```
-
-The app is configured to serve on `www.acsm-converter.com` via a custom domain in `wrangler.jsonc`.
-
-## Fly.io converter backend
-
-The converter runs on Fly.io rather than Cloudflare Containers, because Cloudflare's shared egress IPs hit rate limits from content providers (e.g. Google Play's `acs4_book_bytes` endpoint).
+The converter runs on Fly.io rather than Cloudflare, because Cloudflare's shared egress IPs hit rate limits from content providers (e.g. Google Play's `acs4_book_bytes` endpoint).
 
 ### 1. Provision Postgres and apply the schema
 
@@ -52,27 +44,27 @@ psql "$DATABASE_URL" -f scripts/schema.sql
 
 Caching is optional. If the `DATABASE_URL` is unset, the converter still works. It re-activates a fresh anonymous device on every request.
 
-### 2. Deploy the converter
+### 2. Deploy
 
 ```bash
 flyctl launch --no-deploy   # accept the existing fly.toml; pick an app name + region
-flyctl secrets set AUTH_TOKEN=$(openssl rand -hex 32)
 flyctl secrets set DATABASE_URL="postgres://..."   # from step 1
 flyctl deploy
 ```
 
 To change how many downloads run at once, set `MAX_CONCURRENT_DOWNLOADS` in the `[env]` block of `fly.toml` (default 4). To handle more traffic than a single machine can process, run `flyctl scale count 2` - `fly.toml` is already configured to route requests safely across machines and to drain in-flight conversions on shutdown.
 
-Note the public URL (e.g. `https://your-app.fly.dev`) and the `AUTH_TOKEN` value.
+### 3. Custom domain
 
-### 3. Point the Worker at the converter
-
-The Worker calls the Fly app URL hardcoded in `src/index.js` (`acsm-converter-fly.fly.dev`) - update it if your app name differs. Store the auth token as a Worker secret, then deploy:
+The site is served at `www.acsm-converter.com`; requests to the bare `acsm-converter.com` are redirected there by `server.py`.
 
 ```bash
-npx wrangler secret put FLY_AUTH_TOKEN   # paste the same value used for AUTH_TOKEN above
-npm run deploy
+flyctl certs add www.acsm-converter.com
+flyctl certs add acsm-converter.com
+flyctl ips list
 ```
+
+Point `www` at the app with a CNAME to `<app>.fly.dev`, the bare domain with A/AAAA records to the IPs from `flyctl ips list`, and add the `_acme-challenge` records `flyctl certs` asks for.
 
 ## Known error codes
 

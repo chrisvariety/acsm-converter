@@ -11,5 +11,3 @@ Adobe-Digital-Editions/
 *.epub
 *.drm
 .DS_Store
-node_modules
-.wrangler/
