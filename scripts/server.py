@@ -38,10 +38,6 @@ INDEX_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inde
 with open(INDEX_HTML_PATH, "rb") as _f:
     INDEX_HTML = _f.read()
 
-# The bare domain only redirects, so every visitor ends up on one canonical host.
-APEX_HOST = "acsm-converter.com"
-CANONICAL_ORIGIN = "https://www.acsm-converter.com"
-
 CRED_FILES = ("device.xml", "activation.xml", "devicesalt")
 
 # Hard ceilings so a stalled provider connection can't hang the request
@@ -700,13 +696,6 @@ def _download_name(filename):
 
 class ConvertHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        host = self.headers.get("Host", "").split(":")[0].lower()
-        if host == APEX_HOST:
-            self.send_response(301)
-            self.send_header("Location", CANONICAL_ORIGIN + self.path)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
         if self.path.split("?")[0] == "/":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")

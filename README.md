@@ -56,15 +56,17 @@ To change how many downloads run at once, set `MAX_CONCURRENT_DOWNLOADS` in the 
 
 ### 3. Custom domain
 
-The site is served at `www.acsm-converter.com`; requests to the bare `acsm-converter.com` are redirected there by `server.py`.
+DNS for `acsm-converter.com` is on Cloudflare, proxied in front of Fly:
 
 ```bash
 flyctl certs add www.acsm-converter.com
-flyctl certs add acsm-converter.com
-flyctl ips list
 ```
 
-Point `www` at the app with a CNAME to `<app>.fly.dev`, the bare domain with A/AAAA records to the IPs from `flyctl ips list`, and add the `_acme-challenge` records `flyctl certs` asks for.
+- `www`: proxied CNAME to `<app>.fly.dev`, plus the `_acme-challenge` CNAME that
+  `flyctl certs` asks for (Fly can't validate through the proxy otherwise)
+- SSL/TLS mode: **Full (strict)** (Flexible loops forever against `force_https`)
+- Bare domain: a proxied placeholder record and a Cloudflare Redirect Rule sending it
+  to `https://www.acsm-converter.com` (path and query preserved)
 
 ## Known error codes
 
