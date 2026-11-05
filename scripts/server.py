@@ -19,6 +19,8 @@ from contextlib import closing, contextmanager
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlsplit
 
+import jinja2
+
 try:
     import psycopg2
 except ImportError:  # caching is optional; server still runs without it
@@ -33,13 +35,27 @@ except ImportError:  # caching is optional; server still runs without it
 _draining = threading.Event()
 _server = None
 
-WORK_DIR = "/home/libgourou/work"
+WORK_DIR = os.environ.get("WORK_DIR", "/home/libgourou/work")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# The upload page, served at GET /. Read once at startup: it only changes on deploy.
-INDEX_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-with open(INDEX_HTML_PATH, "rb") as _f:
-    INDEX_HTML = _f.read()
+# Pages are Jinja2 templates (templates/), one per screen; the CSS and the
+# conversion script they share are plain files (static/). Both only change on
+# deploy, so static files are read once at startup and Jinja caches templates.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES = jinja2.Environment(
+    loader=jinja2.FileSystemLoader(os.path.join(_HERE, "templates")),
+    autoescape=True,
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+_STATIC_TYPES = {".css": "text/css; charset=utf-8",
+                 ".js": "text/javascript; charset=utf-8"}
+STATIC_FILES = {}  # "/static/<name>" -> (bytes, content type); nothing else is served
+for _name in sorted(os.listdir(os.path.join(_HERE, "static"))):
+    _type = _STATIC_TYPES.get(os.path.splitext(_name)[1])
+    if _type:
+        with open(os.path.join(_HERE, "static", _name), "rb") as _f:
+            STATIC_FILES["/static/" + _name] = (_f.read(), _type)
 
 CRED_FILES = ("device.xml", "activation.xml", "devicesalt")
 
@@ -410,6 +426,25 @@ def load_pending_fulfillment(token):
         if not row:
             return None
         return bytes(row[0]), dict(zip(CRED_FILES, (bytes(col) for col in row[1:])))
+    except Exception as e:
+        print(f"[pending] load failed: {e}", flush=True)
+        return None
+
+
+def load_pending_download_url(token):
+    """The provider download URL for a live token, or None. For rendering
+    /download/<token>, which has no use for the stored device keys."""
+    if not (_caching_enabled() and token):
+        return None
+    try:
+        with closing(psycopg2.connect(DATABASE_URL)) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT download_url FROM pending_fulfillments "
+                "WHERE id = %s AND created_at >= NOW() - make_interval(hours => %s)",
+                (token, PENDING_TTL_HOURS),
+            )
+            row = cur.fetchone()
+        return row[0] if row else None
     except Exception as e:
         print(f"[pending] load failed: {e}", flush=True)
         return None
@@ -788,8 +823,8 @@ WRONG_FILE_GUIDANCE = {
             "heading": "Choose the file again",
             "text": (
                 "Look in your Downloads folder for the file that the download "
-                "button just saved and choose it below. If you're not sure "
-                "which file it is, download it again first."
+                "button in step 1 saved and choose it below. If you're not "
+                "sure which file it is, download it again first."
             ),
         },
     ],
@@ -839,16 +874,18 @@ def _download_name(filename):
 
 class ConvertHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.split("?")[0] == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(INDEX_HTML)))
-            # revalidate every visit so a deploy reaches users immediately
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(INDEX_HTML)
+        path = self.path.split("?")[0]
+        if path == "/":
+            self._page(200, "index.html")
             return
-        if self.path == "/health":
+        if path.startswith("/download/"):
+            self._download_page(path[len("/download/"):])
+            return
+        if path in STATIC_FILES:
+            data, content_type = STATIC_FILES[path]
+            self._send_body(200, data, content_type, "no-cache")
+            return
+        if path == "/health":
             if _draining.is_set():
                 # Fail the check so the proxy stops routing here while we drain.
                 self._json_response(503, {"status": "draining"})
@@ -857,6 +894,41 @@ class ConvertHandler(BaseHTTPRequestHandler):
             return
         self.send_response(404)
         self.end_headers()
+
+    def _download_page(self, token):
+        """GET /download/<token>: the user's browser fetches a book the
+        provider refused to send us, then uploads it to /finish."""
+        download_url = load_pending_download_url(token)
+        if not download_url:
+            self._page(410, "expired.html", ttl_hours=PENDING_TTL_HOURS)
+            return
+        self._page(
+            200, "download.html",
+            token=token,
+            download_url=download_url,
+            provider=_provider_name(download_url),
+            is_pdf=urlsplit(download_url).path.lower().endswith(".pdf"),
+        )
+
+    def _page(self, status, template, **context):
+        html = TEMPLATES.get_template(template).render(**context).encode()
+        # no-cache: revalidate every visit so a deploy reaches users at once.
+        # Pages carrying a token are never stored, and never sent as a
+        # Referer (the store link is noreferrer too, belt and braces).
+        private = "token" in context
+        self._send_body(status, html, "text/html; charset=utf-8",
+                        "no-store" if private else "no-cache",
+                        {"Referrer-Policy": "no-referrer"} if private else None)
+
+    def _send_body(self, status, data, content_type, cache_control, headers=None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", cache_control)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self):
         path, _, query = self.path.partition("?")

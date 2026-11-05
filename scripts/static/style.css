@@ -1,0 +1,65 @@
+* { box-sizing: border-box; }
+body { font-family: system-ui, sans-serif; font-size: 17px; line-height: 1.6; max-width: 660px; margin: 0 auto; padding: 60px 20px; color: #1a1a1a; }
+h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
+h1 a { color: inherit; text-decoration: none; }
+.subtitle { color: #333; font-size: 1.05rem; margin-top: 0; }
+
+.steps { display: flex; gap: 1.5rem; margin: 2.5rem 0; }
+.step { flex: 1; text-align: center; }
+.step-num { display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; border-radius: 50%; background: #1a1a2e; color: #fff; font-weight: 600; font-size: 0.9rem; margin-bottom: 0.5rem; }
+.step-title { font-weight: 600; font-size: 0.95rem; margin-bottom: 0.25rem; }
+.step-desc { font-size: 0.9rem; color: #444; line-height: 1.45; }
+
+form { margin: 1.5rem 0; display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+input[type="file"] { flex: 1; min-width: 200px; }
+button { padding: 0.5rem 1.5rem; font-size: 1rem; cursor: pointer; background: #1a1a2e; color: #fff; border: none; border-radius: 4px; }
+button:hover { background: #2d2d4e; }
+button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+#status { margin-top: 1rem; color: #333; }
+
+.features { display: flex; gap: 2rem; margin-top: 3rem; padding-top: 2rem; border-top: 1px solid #eee; }
+.feature { flex: 1; }
+.feature h3 { font-size: 1rem; margin: 0 0 0.25rem; }
+.feature p { font-size: 0.95rem; color: #333; margin: 0; }
+
+.error { color: #c00; }
+.error-detail { margin-top: 1rem; background: #fff5f5; border: 1px solid #e8c0c0; border-radius: 6px; padding: 1.25rem; text-align: left; }
+.error-detail h2 { font-size: 1.1rem; margin: 0 0 0.25rem; color: #900; }
+.error-detail code { font-size: 0.85rem; color: #555; }
+.error-detail p { margin: 0.75rem 0; color: #333; }
+.error-detail h3 { font-size: 0.95rem; margin: 1rem 0 0.25rem; color: #444; }
+.error-detail ul { margin: 0; padding-left: 1.25rem; }
+.error-detail li { margin: 0.5rem 0; color: #333; }
+
+.done { margin-top: 1rem; color: #222; font-weight: 600; }
+.again { margin-top: 1.25rem; }
+.again a, .start-over a { color: #1a1a2e; }
+.start-over { margin-top: 2rem; color: #333; }
+
+/* /download/<token>: the browser-assisted download, one step per box. */
+.intro { color: #1a1a1a; margin: 1.5rem 0; }
+.task { margin: 1rem 0; background: #f5f7ff; border: 1px solid #c8cff0; border-radius: 6px; padding: 1.25rem; }
+.task h2 { display: flex; align-items: center; gap: 0.6rem; font-size: 1.05rem; margin: 0 0 0.75rem; color: #1a1a2e; }
+.task h2 .step-num { margin: 0; width: 1.75rem; height: 1.75rem; font-size: 0.85rem; }
+.task p { margin: 0.6rem 0; color: #1a1a1a; }
+.task .note { font-size: 0.95rem; color: #333; }
+.store-link { display: inline-block; padding: 0.6rem 1.4rem; background: #1a1a2e; color: #fff; border-radius: 4px; text-decoration: none; font-size: 1rem; }
+.store-link:hover { background: #2d2d4e; }
+.drop-zone { border: 2px dashed #9aa3d0; border-radius: 6px; padding: 1.5rem; text-align: center; color: #333; cursor: pointer; background: #fff; }
+.drop-zone.dragging { border-color: #1a1a2e; background: #eef1ff; }
+.drop-zone.busy { cursor: default; opacity: 0.6; }
+.pick-error { margin: 0 0 0.75rem; padding: 0.75rem 1rem; background: #fff5f5; border: 1px solid #e8c0c0; border-radius: 4px; color: #900; }
+.pick-error strong { display: block; margin-bottom: 0.25rem; }
+
+.log-controls { margin-top: 1rem; text-align: left; }
+.log-controls .support { font-size: 0.95rem; color: #222; margin: 0 0 0.75rem; }
+.log-controls .support a { color: #1a1a2e; }
+.log-toggle { padding: 0.3rem 0.9rem; font-size: 0.85rem; background: #555; }
+.log-toggle:hover { background: #333; }
+.log-output { margin-top: 0.75rem; background: #1a1a2e; color: #e0e0e0; padding: 0.75rem 1rem; border-radius: 4px; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
+
+.footer { margin-top: 3rem; padding-top: 2rem; border-top: 1px solid #eee; text-align: center; }
+.footer a { display: inline-block; color: #999; }
+.footer a:hover { color: #1a1a2e; }
+.footer svg { width: 24px; height: 24px; fill: currentColor; display: block; }

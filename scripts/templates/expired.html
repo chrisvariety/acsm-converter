@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block title %}Link expired - ACSM Converter{% endblock %}
+
+{% block content %}
+  <div class="error-detail">
+    <h2>This download link has expired</h2>
+    <p>It may have already been used to convert the book, or it's more than
+      {{ ttl_hours }} hours old.</p>
+    <ul>
+      <li>
+        <h3>Already converted it?</h3>
+        <p>Check your Downloads folder for the converted EPUB or PDF.</p>
+      </li>
+      <li>
+        <h3>Otherwise, start again</h3>
+        <p>Convert your ACSM file again. If it no longer works, download a
+          fresh ACSM file from your bookstore first.</p>
+      </li>
+    </ul>
+  </div>
+  <p class="again"><a href="/">Convert an ACSM file</a></p>
+{% endblock %}

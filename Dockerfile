@@ -38,6 +38,7 @@ RUN apt-get update && \
   apt-get install -y \
   python3 \
   python3-psycopg2 \
+  python3-jinja2 \
   libpugixml1v5 \
   libzip4 \
   libssl3 \
@@ -45,7 +46,9 @@ RUN apt-get update && \
   && apt-get autoclean \
   && rm -rf /var/lib/apt/lists/*
 
-COPY scripts/server.py scripts/index.html /home/libgourou/
+COPY scripts/server.py /home/libgourou/
+COPY scripts/templates /home/libgourou/templates
+COPY scripts/static /home/libgourou/static
 WORKDIR /home/libgourou
 
 EXPOSE 8080

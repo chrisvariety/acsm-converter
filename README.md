@@ -13,10 +13,11 @@ The converter manages the credential cache by reading from and writing to Postgr
 ## Project structure
 
 ```
-scripts/server.py  # Python HTTP server: serves the page, runs conversions
-scripts/index.html # The upload page (served at /)
-scripts/schema.sql # Postgres schema for the credential cache
-Dockerfile         # Builds libgourou tools + the HTTP server
+scripts/server.py   # Python HTTP server: serves the pages, runs conversions
+scripts/templates/  # Jinja2 page templates (/, /download/<token>, expired link)
+scripts/static/     # CSS and the conversion script the pages share
+scripts/schema.sql  # Postgres schema for the credential cache
+Dockerfile          # Builds libgourou tools + the HTTP server
 fly.toml           # Fly.io configuration
 ```
 

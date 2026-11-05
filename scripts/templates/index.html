@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-title">Choose</div>
+      <div class="step-desc">Pick an <code>.acsm</code> file from your device</div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-title">Convert</div>
+      <div class="step-desc">We handle the download and conversion for you</div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-title">Read</div>
+      <div class="step-desc">Get a standard EPUB or PDF you can open anywhere</div>
+    </div>
+  </div>
+
+  <form id="form">
+    <input type="file" name="file" accept=".acsm" required />
+    <button type="submit">Convert</button>
+  </form>
+  <div id="status"></div>
+  <p class="again" id="again" hidden><a href="/">Convert another file</a></p>
+
+  <div class="features">
+    <div class="feature">
+      <h3>No setup required</h3>
+      <p>No accounts, no installs, no Adobe Digital Editions. Just upload and go.</p>
+    </div>
+    <div class="feature">
+      <h3>Nothing stored</h3>
+      <p>Files are processed in memory and discarded immediately. We don't keep your books or your data.</p>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  <script src="/static/convert.js"></script>
+  <script>
+    const form = document.getElementById("form");
+    const status = document.getElementById("status");
+    const again = document.getElementById("again");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const file = form.file.files[0];
+      if (!file) return;
+      // One screen per outcome: the form goes away while converting and
+      // stays away afterwards, so the only next steps on screen are the ones
+      // that apply (pressing Convert again on a refused download just gets
+      // refused again). "Convert another file" reloads to start over.
+      form.hidden = true;
+      const outcome = await runConversion("/convert", await file.arrayBuffer(), {
+        status: status,
+        // The provider refused to send the book to our server but will send
+        // it to the user's browser: that is its own page, which also
+        // survives a refresh or a closed tab.
+        onManualDownload: (ev) => {
+          location.assign("/download/" + encodeURIComponent(ev.token));
+        },
+      });
+      if (outcome !== "manual") again.hidden = false;
+    });
+  </script>
+{% endblock %}

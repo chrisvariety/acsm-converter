@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% set store = provider or "your bookstore" %}
+{% set Store = provider or "Your bookstore" %}
+
+{% block title %}Download your book - ACSM Converter{% endblock %}
+
+{% block content %}
+  <div id="steps">
+    <p class="intro">
+      {{ Store }} is limiting how many books our server can download right now.
+      You can download this book yourself, then upload it here and we'll finish
+      the conversion.
+    </p>
+
+    <div class="task">
+      <h2><span class="step-num">1</span> Download the book</h2>
+      <a class="store-link" href="{{ download_url }}" target="_blank" rel="noopener noreferrer">Download from {{ store }}</a>
+      {% if is_pdf %}
+      <p class="note">If the book opens in a new tab instead of downloading,
+        the pages may look blank. That's expected: the book is still
+        DRM-protected, and nothing is wrong with it. Save it with the download
+        button in that tab (or Ctrl+S / &#8984;+S), then come back here.</p>
+      {% endif %}
+    </div>
+
+    <div class="task">
+      <h2><span class="step-num">2</span> Choose the file you just downloaded</h2>
+      <div class="pick-error" id="pick-error" role="alert" hidden></div>
+      {# No `accept` filter: we don't control what the store names the file,
+         and on iOS `accept` hides anything that doesn't match. #}
+      <div class="drop-zone" id="drop-zone" tabindex="0" role="button">
+        Drop the file here, or click to choose it
+      </div>
+      <input type="file" id="file" hidden>
+      <p class="note">The downloaded file is still DRM-protected and won't open
+        in most readers yet. Once you choose it, we'll finish the conversion.</p>
+    </div>
+  </div>
+
+  <div id="status"></div>
+  <p class="start-over"><a href="/">Start over with a different file</a></p>
+{% endblock %}
+
+{% block scripts %}
+  <script src="/static/convert.js"></script>
+  <script>
+    const TOKEN = {{ token|tojson }};
+    const steps = document.getElementById("steps");
+    const status = document.getElementById("status");
+    const zone = document.getElementById("drop-zone");
+    const input = document.getElementById("file");
+    const pickError = document.getElementById("pick-error");
+    let busy = false;
+
+    function showPickError(title, text) {
+      pickError.innerHTML = "<strong>" + esc(title) + "</strong>" + esc(text);
+      pickError.hidden = false;
+    }
+
+    async function finish(file) {
+      input.value = ""; // so choosing the same file again still fires "change"
+      if (!file || busy) return;
+      // The ACSM is often the newest file in Downloads (e.g. when the book
+      // opened in a browser tab instead of downloading), so catch it here
+      // rather than uploading it for a generic "wrong file" error.
+      if (/\.acsm$/i.test(file.name)) {
+        showPickError("That's the .acsm file you started with.",
+          "Instead, choose the book file you got from the download button in step 1.");
+        return;
+      }
+      pickError.hidden = true;
+      busy = true;
+      zone.classList.add("busy");
+      const outcome = await runConversion("/finish?token=" + encodeURIComponent(TOKEN), file, {
+        status: status,
+        onManualDownload: () => {}, // /finish never sends one
+        // Wrong file: the token stays valid, so keep the steps and say what
+        // went wrong right above the place to try again.
+        onError: (ev) => {
+          if (!ev.retry_upload) return false;
+          status.innerHTML = "";
+          showPickError(ev.title + ".", ev.description + " " +
+            ((ev.solutions && ev.solutions[0] && ev.solutions[0].text) || ""));
+          return true;
+        },
+      });
+      busy = false;
+      zone.classList.remove("busy");
+      // Delivered: the token is used up, so the steps no longer apply.
+      if (outcome === "done") steps.hidden = true;
+    }
+
+    zone.addEventListener("click", () => { if (!busy) input.click(); });
+    zone.addEventListener("keydown", (e) => {
+      if ((e.key === "Enter" || e.key === " ") && !busy) { e.preventDefault(); input.click(); }
+    });
+    input.addEventListener("change", () => finish(input.files[0]));
+    zone.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      zone.classList.add("dragging");
+    });
+    zone.addEventListener("dragleave", () => zone.classList.remove("dragging"));
+    zone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      zone.classList.remove("dragging");
+      finish(e.dataTransfer.files[0]);
+    });
+  </script>
+{% endblock %}
