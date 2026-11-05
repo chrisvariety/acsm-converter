@@ -71,6 +71,14 @@ namespace gourou
          */
         LoanToken* getLoanToken();
 
+        /**
+         * @brief Return the fulfill reply this item was built from (XML).
+         * Feeding it back to the constructor rebuilds an equivalent item, so
+         * a book can be downloaded by other means and finished later.
+         * (local patch, not upstream)
+         */
+        std::string getFulfillmentXML();
+
     private:
         pugi::xml_document fulfillDoc;
         pugi::xml_node metadatas;

@@ -130,4 +130,12 @@ namespace gourou
     {
         return loanToken;
     }
+
+    std::string FulfillmentItem::getFulfillmentXML()
+    {
+        // format_raw: no indentation added, so text nodes reload unchanged.
+        StringXMLWriter xmlWriter;
+        fulfillDoc.save(xmlWriter, "", pugi::format_raw);
+        return xmlWriter.getResult();
+    }
 }

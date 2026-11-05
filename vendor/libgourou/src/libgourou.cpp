@@ -604,8 +604,6 @@ namespace gourou
 
     DRMProcessor::ITEM_TYPE DRMProcessor::download(FulfillmentItem* item, std::string path, bool resume)
     {
-        ITEM_TYPE res = EPUB;
-
         if (!item)
             EXCEPTION(DW_NO_ITEM, "No item");
 
@@ -619,13 +617,23 @@ namespace gourou
 
         GOUROU_LOG(INFO, "Download into " << path);
 
+        return addRightsToFile(item, path,
+                               headers.count("Content-Type") ? headers["Content-Type"] : "");
+    }
+
+    DRMProcessor::ITEM_TYPE DRMProcessor::addRightsToFile(FulfillmentItem* item, const std::string& path, const std::string& contentType)
+    {
+        ITEM_TYPE res = EPUB;
+
+        if (!item)
+            EXCEPTION(DW_NO_ITEM, "No item");
+
         ByteArray rightsStr(item->getRights());
 
         if (item->getMetadata("format").find("application/pdf") != std::string::npos)
             res = PDF;
 
-        if (headers.count("Content-Type") &&
-            headers["Content-Type"].find("application/pdf") != std::string::npos)
+        if (contentType.find("application/pdf") != std::string::npos)
             res = PDF;
 
         if (res == EPUB)

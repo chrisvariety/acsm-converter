@@ -11,7 +11,22 @@ Upstream: https://forge.soutade.fr/soutade/libgourou.git
 Commit:   324c566 ("Fix help of adept_load_mgt", v0.8.9)
 
 Vendored verbatim (build artifacts excluded: `obj/`, compiled `utils/*` binaries),
-with one local patch:
+with these local patches:
+
+- **Split fulfill and download** (for the browser-assisted download in
+  `scripts/server.py`, used when Google Play answers our download with 429):
+  - `FulfillmentItem::getFulfillmentXML()` returns the fulfill reply an item
+    was built from; passing it back to the `FulfillmentItem` constructor
+    rebuilds an equivalent item (license, rights, metadata).
+  - `DRMProcessor::download()` is split: the post-download half (adding
+    `META-INF/rights.xml` to an EPUB, or the EBX handler to a PDF) is now the
+    public `DRMProcessor::addRightsToFile()`, and `download()` calls it. No
+    behaviour change for `download()` itself.
+  - `acsmdownloader` gets `--save-fulfillment <file>` (write the fulfill reply
+    before downloading, so it survives a refused download) and
+    `--from-file <book> --fulfillment <file>` (skip the network: finish a book
+    file obtained elsewhere exactly as a download would be finished, including
+    the `Created <name>` line and file naming).
 
 - `utils/drmprocessorclientimpl.cpp` (`sendRequest`): the `CLIENT_HTTP_ERROR`
   message carries the request URL, i.e. `HTTP Error code 429 <URL>` instead of

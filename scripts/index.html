@@ -38,6 +38,17 @@
     .error-detail ul { margin: 0; padding-left: 1.25rem; }
     .error-detail li { margin: 0.5rem 0; color: #333; }
 
+    .manual { margin-top: 1rem; background: #f5f7ff; border: 1px solid #c8cff0; border-radius: 6px; padding: 1.25rem; text-align: left; }
+    .manual h2 { font-size: 1.1rem; margin: 0 0 0.5rem; color: #1a1a2e; }
+    .manual p { margin: 0.5rem 0; color: #333; }
+    .manual ol { margin: 0.75rem 0 0; padding-left: 1.25rem; }
+    .manual li { margin: 0.75rem 0; color: #333; }
+    .manual .store-link { display: inline-block; margin-top: 0.4rem; padding: 0.5rem 1.25rem; background: #1a1a2e; color: #fff; border-radius: 4px; text-decoration: none; }
+    .manual .store-link:hover { background: #2d2d4e; }
+    .drop-zone { margin-top: 0.4rem; border: 2px dashed #9aa3d0; border-radius: 6px; padding: 1.25rem; text-align: center; color: #555; cursor: pointer; background: #fff; }
+    .drop-zone.dragging { border-color: #1a1a2e; background: #eef1ff; }
+    .manual .note { font-size: 0.85rem; color: #666; }
+
     .log-controls { margin-top: 1rem; text-align: left; }
     .log-controls .support { font-size: 0.9rem; color: #333; margin: 0 0 0.75rem; }
     .log-controls .support a { color: #1a1a2e; }
@@ -103,10 +114,15 @@
     // failure so users can copy the same stream they'd see in dev tools.
     let eventLog = [];
 
+    // The last `manual_download` event, kept so the upload box can be shown
+    // again if the user picks the wrong file (the token stays valid).
+    let pendingManual = null;
+
     const STAGE_LABELS = {
       hydrate: "Starting...",
       activate: "Preparing...",
       download: "Processing file...",
+      prepare: "Checking your file...",
       decrypt: "Finalizing...",
     };
 
@@ -115,12 +131,16 @@
       const file = form.file.files[0];
       if (!file) return;
       eventLog = [];
+      pendingManual = null;
+      await runConversion("/convert", await file.arrayBuffer());
+    });
+
+    // POSTs to /convert (an ACSM) or /finish (the book the user's browser
+    // downloaded), then follows the shared NDJSON stream to a result or error.
+    async function runConversion(url, body) {
       setStatus("Uploading...");
       try {
-        const resp = await fetch("/convert", {
-          method: "POST",
-          body: await file.arrayBuffer(),
-        });
+        const resp = await fetch(url, { method: "POST", body: body });
         if (!resp.ok) {
           const err = await resp.json().catch(() => null);
           showPlainError(err && err.error ? err.error : "Conversion failed: " + resp.statusText);
@@ -129,6 +149,7 @@
 
         let resultEvent = null;
         let errorEvent = null;
+        let manualEvent = null;
         const payload = await readStream(resp.body, (event) => {
           switch (event.type) {
             case "queued":
@@ -153,6 +174,9 @@
               break;
             case "error":
               errorEvent = event;
+              break;
+            case "manual_download":
+              manualEvent = event;
               break;
           }
         });
@@ -182,10 +206,19 @@
           // a multi-hundred-MB blob, which is exactly the size we are here to
           // support. Hold the URL long enough for the browser to take it.
           setTimeout(() => URL.revokeObjectURL(url), 60000);
+          pendingManual = null;
           setStatus("Done! Your file is downloading.");
+        } else if (manualEvent) {
+          pendingManual = manualEvent;
+          showManualDownload(manualEvent);
         } else if (errorEvent) {
           if (errorEvent.error_code) {
             showKnownError(errorEvent);
+            // Wrong file uploaded to /finish: the same token still works, so
+            // offer the download + upload steps again under the error.
+            if (errorEvent.retry_upload && pendingManual) {
+              status.appendChild(buildManualPanel(pendingManual));
+            }
           } else {
             const parts = [errorEvent.error || "Conversion failed"];
             if (errorEvent.stdout) parts.push("stdout: " + errorEvent.stdout);
@@ -198,7 +231,70 @@
       } catch (err) {
         showPlainError(err.name + ": " + err.message);
       }
-    });
+    }
+
+    // The provider refused to send the book to our server, but it will send
+    // it to the user's browser. Step 1 opens the provider's download link;
+    // step 2 takes the downloaded file and posts it to /finish.
+    function showManualDownload(ev) {
+      status.className = "";
+      status.style.whiteSpace = "";
+      status.innerHTML = "";
+      status.appendChild(buildManualPanel(ev));
+    }
+
+    function buildManualPanel(ev) {
+      const store = ev.provider || "your bookstore";
+      const Store = ev.provider || "Your bookstore";
+
+      const box = document.createElement("div");
+      box.className = "manual";
+      box.innerHTML =
+        "<h2>Download your book directly from " + esc(store) + "</h2>" +
+        "<p>" + esc(Store) + " is limiting how many files our server can download right now. " +
+        "You can download the book yourself, then upload it here so we can finish " +
+        "the conversion. Here's how:</p>" +
+        "<ol>" +
+        '<li><strong>Download the book</strong><br>' +
+        '<a class="store-link" target="_blank" rel="noopener noreferrer"></a></li>' +
+        '<li><strong>Then choose the file you just downloaded</strong>' +
+        '<div class="drop-zone" tabindex="0" role="button">' +
+        "Drop the file here, or click to choose it" +
+                // No `accept` filter: we don't control what the store names the
+        // file, and on iOS `accept` hides anything that doesn't match.
+        '</div><input type="file" hidden></li>' +
+        "</ol>" +
+        '<p class="note">The downloaded file is still DRM-protected and won\'t ' +
+        "open in most readers yet. Once you choose it, we'll finish the " +
+        "conversion as usual.</p>";
+
+      const link = box.querySelector(".store-link");
+      link.href = ev.download_url;
+      link.textContent = "Download from " + (ev.provider || "your bookstore");
+
+      const zone = box.querySelector(".drop-zone");
+      const input = box.querySelector("input[type=file]");
+      const finish = (file) => {
+        if (!file) return;
+        runConversion("/finish?token=" + encodeURIComponent(ev.token), file);
+      };
+      zone.addEventListener("click", () => input.click());
+      zone.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); }
+      });
+      input.addEventListener("change", () => finish(input.files[0]));
+      zone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        zone.classList.add("dragging");
+      });
+      zone.addEventListener("dragleave", () => zone.classList.remove("dragging"));
+      zone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        zone.classList.remove("dragging");
+        finish(e.dataTransfer.files[0]);
+      });
+      return box;
+    }
 
     // Reads the response: NDJSON progress events, then -- once the terminal
     // "result" event arrives -- every remaining byte as the file itself.

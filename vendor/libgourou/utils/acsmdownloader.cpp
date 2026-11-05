@@ -30,6 +30,9 @@
 #include <libgen.h>
 
 #include <iostream>
+#include <fstream>
+#include <stdexcept>
+#include <cstring>
 #include <algorithm>
 
 #include <libgourou.h>
@@ -47,6 +50,14 @@ static const char* outputFile     = 0;
 static const char* outputDir      = 0;
 static       bool  resume         = false;
 static       bool  notify         = true;
+// Local patch (not upstream): split fulfill and download across two runs, so
+// a book whose download was refused can be fetched by other means (e.g. the
+// user's own browser) and finished later without fulfilling it again.
+static const char* saveFulfillment = 0;  // write the fulfill reply here
+static const char* fromFile        = 0;  // already-downloaded encrypted book
+static const char* fulfillmentFile = 0;  // fulfill reply saved by an earlier run
+
+enum { OPT_SAVE_FULFILLMENT = 1000, OPT_FROM_FILE, OPT_FULFILLMENT };
 
 
 class ACSMDownloader
@@ -82,7 +93,23 @@ public:
             }
             else
             {
-                gourou::FulfillmentItem* item = processor.fulfill(acsmFile, notify);
+                gourou::FulfillmentItem* item;
+                pugi::xml_document fulfillDoc;  // FulfillmentItem keeps its own copy
+
+                if (fromFile)
+                {
+                    if (!fulfillDoc.load_file(fulfillmentFile))
+                        throw std::runtime_error(std::string("Invalid fulfillment file ") + fulfillmentFile);
+                    item = new gourou::FulfillmentItem(fulfillDoc, user);
+                }
+                else
+                {
+                    item = processor.fulfill(acsmFile, notify);
+
+                    // Saved before downloading, so it survives a refused download.
+                    if (saveFulfillment)
+                        gourou::writeFile(saveFulfillment, item->getFulfillmentXML());
+                }
 
                 std::string filename;
                 if (outputFile)
@@ -104,7 +131,30 @@ public:
     
                 createPath(filename.c_str());
 
-                gourou::DRMProcessor::ITEM_TYPE type = processor.download(item, filename, resume);
+                gourou::DRMProcessor::ITEM_TYPE type;
+                if (fromFile)
+                {
+                    std::ifstream in(fromFile, std::ios::binary);
+                    if (!in)
+                        throw std::runtime_error(std::string("Unable to open ") + fromFile);
+                    // No Content-Type header to go on, so sniff the magic the
+                    // way the server's header would have told us.
+                    char magic[5] = {0};
+                    in.read(magic, sizeof(magic));
+                    std::string contentType =
+                        (in.gcount() == 5 && !memcmp(magic, "%PDF-", 5)) ? "application/pdf" : "";
+                    in.clear();
+                    in.seekg(0);
+                    {
+                        std::ofstream out(filename, std::ios::binary | std::ios::trunc);
+                        out << in.rdbuf();
+                        if (!out)
+                            throw std::runtime_error("Unable to write " + filename);
+                    }
+                    type = processor.addRightsToFile(item, filename, contentType);
+                }
+                else
+                    type = processor.download(item, filename, resume);
 
                 if (!outputFile)
                 {
@@ -188,6 +238,9 @@ static void usage(const char* cmd)
     std::cout << "  " << "-e|--export-private-key"<< "\t" << "Export private key in DER format" << std::endl;
     std::cout << "  " << "-r|--resume"          << "\t\t" << "Try to resume download (in case of previous failure)" << std::endl;
     std::cout << "  " << "-N|--no-notify"       << "\t\t" << "Don't notify server, even if requested" << std::endl;
+    std::cout << "  " << "--save-fulfillment"   << "\t"   << "Write the fulfill reply to this file before downloading" << std::endl;
+    std::cout << "  " << "--from-file"          << "\t\t" << "Skip fulfill+download; finish this already-downloaded file (needs --fulfillment, no ACSM)" << std::endl;
+    std::cout << "  " << "--fulfillment"        << "\t\t" << "Fulfill reply saved by --save-fulfillment, used with --from-file" << std::endl;
     std::cout << "  " << "-v|--verbose"         << "\t\t" << "Increase verbosity, can be set multiple times" << std::endl;
     std::cout << "  " << "-V|--version"         << "\t\t" << "Display libgourou version" << std::endl;
     std::cout << "  " << "-h|--help"            << "\t\t" << "This help" << std::endl;
@@ -234,6 +287,9 @@ int main(int argc, char** argv)
             {"verbose",          no_argument,       0,  'v' },
             {"version",          no_argument,       0,  'V' },
             {"help",             no_argument,       0,  'h' },
+            {"save-fulfillment", required_argument, 0,  OPT_SAVE_FULFILLMENT },
+            {"from-file",        required_argument, 0,  OPT_FROM_FILE },
+            {"fulfillment",      required_argument, 0,  OPT_FULFILLMENT },
             {0,                  0,                 0,  0 }
         };
 
@@ -287,6 +343,15 @@ int main(int argc, char** argv)
         case 'h':
             usage(argv[0]);
             return 0;
+        case OPT_SAVE_FULFILLMENT:
+            saveFulfillment = optarg;
+            break;
+        case OPT_FROM_FILE:
+            fromFile = optarg;
+            break;
+        case OPT_FULFILLMENT:
+            fulfillmentFile = optarg;
+            break;
         default:
             usage(argv[0]);
             return -1;
@@ -298,8 +363,15 @@ int main(int argc, char** argv)
     if (optind == argc-1)
         acsmFile = argv[optind];
 
-    if ((!acsmFile && !exportPrivateKey) || (outputDir && !outputDir[0]) ||
+    if ((!acsmFile && !exportPrivateKey && !fromFile) || (outputDir && !outputDir[0]) ||
         (outputFile && !outputFile[0]))
+    {
+        usage(argv[0]);
+        return -1;
+    }
+
+    // --from-file replaces the ACSM entirely; it is a separate mode.
+    if (fromFile && (!fulfillmentFile || acsmFile || exportPrivateKey || saveFulfillment))
     {
         usage(argv[0]);
         return -1;
@@ -337,6 +409,15 @@ int main(int argc, char** argv)
         {
             usage(argv[0]);
             return -1;
+        }
+    }
+    else if (fromFile)
+    {
+        if (!pathExists(fromFile) || !pathExists(fulfillmentFile))
+        {
+            std::cout << "Error : " << fromFile << " or " << fulfillmentFile << " doesn't exists" << std::endl;
+            ret = -1;
+            goto end;
         }
     }
     else

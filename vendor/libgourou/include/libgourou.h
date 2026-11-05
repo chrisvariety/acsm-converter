@@ -86,6 +86,20 @@ namespace gourou
         ITEM_TYPE download(FulfillmentItem* item, std::string path, bool resume=false);
 
         /**
+         * @brief Add DRM information to an already downloaded file, i.e. the
+         * second half of download(). Lets a file fetched some other way (e.g.
+         * by the user's browser) be finished exactly as download() would.
+         * (local patch, not upstream)
+         *
+         * @param item            Item from fulfill() or rebuilt from getFulfillmentXML()
+         * @param path            Downloaded file, modified in place
+         * @param contentType     Content-Type the file was served with, if known
+         *
+         * @return Type of item
+         */
+        ITEM_TYPE addRightsToFile(FulfillmentItem* item, const std::string& path, const std::string& contentType="");
+
+        /**
          * @brief SignIn into ACS Server (required to activate device)
          *
          * @param adobeID         AdobeID username

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -13,8 +14,10 @@ import tempfile
 import threading
 import time
 import traceback
+import xml.etree.ElementTree as ET
 from contextlib import closing, contextmanager
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlsplit
 
 try:
     import psycopg2
@@ -72,6 +75,13 @@ DRAIN_GRACE = 2
 HEARTBEAT_INTERVAL = 15
 # Read size when streaming the result body to the client.
 RESULT_CHUNK = 3 * 1024 * 1024
+# Read size when spooling an uploaded book (POST /finish) to disk.
+UPLOAD_CHUNK = 1024 * 1024
+# How long a refused download can be finished via POST /finish. A Google
+# download link still worked when opened by hand some minutes after its 429;
+# its real lifetime is unknown. A day covers a user who wandered off and
+# bounds how long we hold a copy of the device keys.
+PENDING_TTL_HOURS = 24
 # How often a queued request emits a "waiting" event. Doubles as the keep-alive
 # for a connection that has nothing else to say yet.
 QUEUE_HEARTBEAT = 10
@@ -335,6 +345,110 @@ def claim_cached_creds(cache_key, creds):
         print(f"[creds] cache write failed: {e}", flush=True)
         return creds
 
+
+# --- Browser-assisted download ------------------------------------------------
+#
+# Google Play's book host (books.google.com/books/download/...) answers a large
+# share of our downloads with HTTP 429 -- ~38% of Google conversions over Oct 30
+# -Nov 5 2026, and never any other provider's. Fulfill itself succeeds: the 429
+# lands on the plain GET of the book file, and retrying the same ACSM never got
+# past it (0 of 164 files). The download URL is not tied to our IP, though, so
+# the user's own browser can fetch it. When that happens we keep what the
+# second half of the conversion needs -- Google's fulfill reply (license, rights,
+# metadata) and the device that fulfilled it -- under a random token, and the
+# client posts the downloaded file back to /finish?token=... to complete it
+# without contacting the provider again.
+
+def save_pending_fulfillment(fulfillment_xml, creds, download_url):
+    """Store a refused download for /finish; return its token, or None."""
+    if not _caching_enabled():
+        return None
+    token = secrets.token_urlsafe(32)
+    try:
+        with closing(psycopg2.connect(DATABASE_URL)) as conn:
+            with conn, conn.cursor() as cur:
+                # Prune here rather than on a timer: we have no scheduler, and
+                # this is the only place rows are created.
+                cur.execute(
+                    "DELETE FROM pending_fulfillments "
+                    "WHERE created_at < NOW() - make_interval(hours => %s)",
+                    (PENDING_TTL_HOURS,),
+                )
+                cur.execute(
+                    "INSERT INTO pending_fulfillments "
+                    "(id, fulfillment_xml, device_xml, activation_xml, devicesalt, "
+                    " download_url, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, NOW())",
+                    (
+                        token,
+                        psycopg2.Binary(fulfillment_xml),
+                        psycopg2.Binary(creds["device.xml"]),
+                        psycopg2.Binary(creds["activation.xml"]),
+                        psycopg2.Binary(creds["devicesalt"]),
+                        download_url,
+                    ),
+                )
+        return token
+    except Exception as e:
+        print(f"[pending] save failed: {e}", flush=True)
+        return None
+
+
+def load_pending_fulfillment(token):
+    """Return (fulfillment_xml, creds) for a live token, or None."""
+    if not (_caching_enabled() and token):
+        return None
+    try:
+        with closing(psycopg2.connect(DATABASE_URL)) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT fulfillment_xml, device_xml, activation_xml, devicesalt "
+                "FROM pending_fulfillments "
+                "WHERE id = %s AND created_at >= NOW() - make_interval(hours => %s)",
+                (token, PENDING_TTL_HOURS),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return bytes(row[0]), dict(zip(CRED_FILES, (bytes(col) for col in row[1:])))
+    except Exception as e:
+        print(f"[pending] load failed: {e}", flush=True)
+        return None
+
+
+def delete_pending_fulfillment(token):
+    """Forget a token once its book has been delivered. Best-effort."""
+    if not (_caching_enabled() and token):
+        return
+    try:
+        with closing(psycopg2.connect(DATABASE_URL)) as conn:
+            with conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM pending_fulfillments WHERE id = %s", (token,))
+    except Exception as e:
+        print(f"[pending] delete failed: {e}", flush=True)
+
+
+def _fulfillment_download_url(fulfillment_xml):
+    """The book's download URL from a fulfill reply, or None."""
+    try:
+        node = ET.fromstring(fulfillment_xml).find(
+            ".//{*}fulfillmentResult/{*}resourceItemInfo/{*}src")
+    except ET.ParseError:
+        return None
+    return node.text.strip() if node is not None and node.text else None
+
+
+def _fulfillment_path(work_dir):
+    """Where acsmdownloader saves (and later reads) the fulfill reply."""
+    return os.path.join(work_dir, "meta", "fulfillment.xml")
+
+
+def _provider_name(url):
+    """User-facing store name for a download URL, if we know it."""
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "google.com" or host.endswith(".google.com"):
+        return "Google Play Store"
+    return None
+
 # Shared card for upstream 5xx responses (libgourou exception 0x5011,
 # CLIENT_HTTP_ERROR). Raised whenever Adobe's ACS (adeactivate.adobe.com) or the
 # provider's distributor answers with a gateway/server error. libgourou retries
@@ -480,27 +594,32 @@ KNOWN_ERRORS = {
             },
         ],
     },
+    # Only shown when the browser-assisted download can't be offered (the 429
+    # hit a step other than the book download, or there is no database). The
+    # old advice to wait and retry the same file was wrong for the case we see
+    # most: across 164 Google ACSMs retried after a 429, none ever succeeded.
     "HTTP Error code 429": {
         "title": "Rate limited by the content provider",
         "description": (
-            "The content provider returned HTTP 429 (Too Many Requests). This is "
-            "usually a short-lived rate limit applied to the server's IP address "
-            "or to the specific book you're trying to download."
+            "The content provider returned HTTP 429 (Too Many Requests) and "
+            "refused to send the book to our server. Retrying the same ACSM "
+            "file rarely gets past this."
         ),
         "solutions": [
             {
-                "heading": "Wait and try again",
+                "heading": "Get a fresh ACSM file",
                 "text": (
-                    "Rate limits typically clear in a few minutes. Wait 5-15 "
-                    "minutes and try converting again."
+                    "Download a new ACSM file for this book from your content "
+                    "provider and convert that one instead. This sometimes "
+                    "works where the old file keeps failing."
                 ),
             },
             {
-                "heading": "Try a fresh ACSM file",
+                "heading": "Try again later",
                 "text": (
-                    "If retrying doesn't help, download a new ACSM file from your "
-                    "content provider -- the specific file may have hit a per-book "
-                    "download limit."
+                    "If a fresh file fails the same way, the provider is "
+                    "limiting our server. Wait a while before trying again "
+                    "with another fresh ACSM file."
                 ),
             },
         ],
@@ -652,6 +771,31 @@ SIGNAL_GUIDANCE = {
     ],
 }
 
+# POST /finish: the uploaded file couldn't be turned into the book we fulfilled.
+# `retry_upload` tells the page to keep the upload box open, since the same
+# token still works with the right file.
+WRONG_FILE_GUIDANCE = {
+    "error_code": "Downloaded file not recognized",
+    "retry_upload": True,
+    "title": "That doesn't look like the right file",
+    "description": (
+        "The file you chose couldn't be matched to this book. It may be a "
+        "different book, a download that didn't finish, or an error page saved "
+        "in place of the book."
+    ),
+    "solutions": [
+        {
+            "heading": "Choose the file again",
+            "text": (
+                "Look in your Downloads folder for the file that the download "
+                "button just saved (usually an .epub or .pdf named after the "
+                "book) and choose it below. If you're not sure, download it "
+                "again first."
+            ),
+        },
+    ],
+}
+
 
 def _signal_name(returncode):
     """Name of the signal that killed a subprocess, or None for normal exits.
@@ -716,7 +860,8 @@ class ConvertHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        if self.path != "/convert":
+        path, _, query = self.path.partition("?")
+        if path not in ("/convert", "/finish"):
             self.send_response(404)
             self.end_headers()
             return
@@ -725,6 +870,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
             # Shutting down: refuse rather than start a fulfillment we cannot
             # finish, since a kill mid-download burns the ACSM. Under bluegreen
             # a fresh machine is already serving, so the client can just retry.
+            # (/finish fulfills nothing, but a retry is just as cheap there.)
             self._json_response(503, {"error": "Server is shutting down; please retry"})
             return
 
@@ -733,8 +879,24 @@ class ConvertHandler(BaseHTTPRequestHandler):
             self._json_response(400, {"error": "Empty request body"})
             return
 
-        body = self.rfile.read(content_length)
-        print(f"[convert] Received {content_length} bytes", flush=True)
+        if path == "/finish":
+            token = parse_qs(query).get("token", [None])[0]
+            pending = load_pending_fulfillment(token)
+            if not pending:
+                # Read the upload off the socket before answering: replying
+                # mid-upload and closing makes browsers report a bare network
+                # error instead of this message.
+                self._discard_body(content_length)
+                self._json_response(410, {"error": (
+                    "This download has expired or was already completed. "
+                    "Please convert your ACSM file again.")})
+                return
+            print(f"[finish] Receiving {content_length} bytes", flush=True)
+            work = lambda: self._do_finish(token, pending, content_length)
+        else:
+            body = self.rfile.read(content_length)
+            print(f"[convert] Received {content_length} bytes", flush=True)
+            work = lambda: self._do_convert(body)
 
         # Start NDJSON streaming response. After this point, errors are
         # reported as {"type":"error",...} events, not via HTTP status.
@@ -755,7 +917,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
 
         try:
             with _active_request():
-                self._do_convert(body)
+                work()
         except (BrokenPipeError, ConnectionResetError):
             print(f"[convert] Client disconnected during {self._stage}", flush=True)
         except _DrainAbort:
@@ -813,134 +975,28 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 self._send_event({"type": "status", "stage": "download",
                                   "message": "Downloading encrypted file"})
                 print("[convert] starting download (acsmdownloader)", flush=True)
+                # The fulfill reply is written before the download starts, so
+                # it survives a refused download (see _offer_browser_download).
+                # Kept in its own subdirectory: acsmdownloader names the book
+                # after its title in cwd, and a title can be anything.
+                os.makedirs(os.path.join(work_dir, "meta"))
                 result = self._run(
-                    ["acsmdownloader", "--adept-directory", adept_dir, acsm_path],
+                    ["acsmdownloader", "--adept-directory", adept_dir,
+                     "--save-fulfillment", _fulfillment_path(work_dir), acsm_path],
                     cwd=work_dir,
                     timeout=DOWNLOAD_TIMEOUT,
                     heartbeat_stage="download",
                 )
             # Download slot released: whoever is next starts fetching now,
             # rather than waiting on the decrypt below.
-
-            # acsmdownloader announces what it wrote as `Created <name>`
-            # (acsmdownloader.cpp:119). Everything after that marker is the
-            # name, and it is taken verbatim: it comes from the book's
-            # `dc:title`, so it can legitimately begin or end with spaces.
-            # Stripping it is what broke a title of "   .     " -- we went
-            # looking for ".     .epub" while the file on disk was
-            # "   .     .epub", then handed the missing path to adept_remove,
-            # whose fileCopy() tests `!fd` against an open() that returns -1 on
-            # failure. So it copied nothing, left an empty file, and libzip
-            # rejected it: "Invalid zip file <output>", pointing at the output
-            # for a fault in the input.
-            #
-            # The marker is searched for anywhere in the line rather than
-            # anchored, because libgourou draws its progress meter with a
-            # leading \r and no trailing newline (drmprocessorclientimpl.cpp:164).
-            # It does emit one endl when the transfer ends, so today `Created`
-            # starts its own line -- but a run that skips that endl would
-            # otherwise glue "Download 100%" to the front of the name.
-            output_filename = None
-            for line in result.stdout.splitlines():
-                _, marker, name = line.partition("Created ")
-                if marker and name.lower().endswith((".epub", ".pdf")):
-                    output_filename = name
-                    break
-
-            if not output_filename:
-                self._send_event({
-                    "type": "error",
-                    "error": "Could not determine output filename",
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                })
-                return
-
-            encrypted_path = os.path.join(work_dir, output_filename)
-            if not os.path.exists(encrypted_path):
-                # The name we read back no longer matches what is on disk.
-                # Stop here: passing a missing path to adept_remove reports
-                # "Invalid zip file <output>" instead, which sends anyone
-                # reading the log after the wrong file entirely.
-                print(f"[convert] ERROR: parsed {output_filename!r} but no such file "
-                      f"in {work_dir}: {os.listdir(work_dir)}", flush=True)
-                self._send_event({
-                    "type": "error",
-                    "error": "Downloaded file not found",
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                })
-                return
-
-            decrypted_path = os.path.join(work_dir, "decrypted_" + output_filename)
-            enc_size = os.path.getsize(encrypted_path)
-            print(f"[convert] downloaded {output_filename!r} ({enc_size} bytes); removing DRM",
-                  flush=True)
-
-            with _decrypt_gate.hold(on_wait=self._queue_notice("decrypt")):
-                self._send_event({"type": "status", "stage": "decrypt",
-                                  "message": "Removing DRM"})
-                self._run([
-                    "adept_remove",
-                    "--adept-directory", adept_dir,
-                    "--output-file", decrypted_path,
-                    encrypted_path,
-                ], timeout=DECRYPT_TIMEOUT, heartbeat_stage="decrypt")
-
-            content_type = (
-                "application/epub+zip" if output_filename.lower().endswith(".epub")
-                else "application/pdf"
-            )
-            download_name = _download_name(output_filename)
-            out_size = os.path.getsize(decrypted_path)
-            print(f"[convert] Success! Returning {download_name!r} "
-                  f"(on disk {output_filename!r}, {out_size} bytes)", flush=True)
-            self._send_file_result(download_name, content_type, decrypted_path)
+            self._deliver(result, work_dir, adept_dir, "[convert]")
 
         except subprocess.CalledProcessError as e:
-            output = (e.stdout or "") + (e.stderr or "")
-            label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
-            sig = _signal_name(e.returncode)
-            sig_suffix = f" ({sig})" if sig else ""
-            print(f"[convert] ERROR: {label} failed rc={e.returncode}{sig_suffix}", flush=True)
-            print(f"[convert] stdout: {e.stdout}", flush=True)
-            print(f"[convert] stderr: {e.stderr}", flush=True)
-
-            error_code, known = _match_known_error(output)
-            if known:
-                self._send_event({"type": "error", "error_code": error_code, **known})
-            elif e.returncode is not None and e.returncode < 0:
-                # Killed by a signal — empty stdout/stderr is typical.
-                # Render a structured "internal failure" card so the user gets
-                # retry guidance instead of a raw blob, and include
-                # returncode/signal: the page keeps every event line and shows
-                # them under "Show log", so those land in the bug report.
-                self._send_event({
-                    "type": "error",
-                    **SIGNAL_GUIDANCE,
-                    "error_code": f"Internal failure ({sig or 'crash'})",
-                    "command": label,
-                    "returncode": e.returncode,
-                })
-            else:
-                self._send_event({
-                    "type": "error",
-                    "error": f"{label} failed (exit {e.returncode})",
-                    "command": label,
-                    "returncode": e.returncode,
-                    "stdout": e.stdout or "",
-                    "stderr": e.stderr or "",
-                })
+            self._log_process_error(e, "[convert]")
+            if not self._offer_browser_download(e, work_dir, adept_dir):
+                self._report_process_error(e)
         except subprocess.TimeoutExpired as e:
-            label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
-            print(f"[convert] ERROR: {label} timed out after {e.timeout}s", flush=True)
-            guidance = TIMEOUT_GUIDANCE.get(label, TIMEOUT_GUIDANCE["_default"])
-            self._safe_terminal_event({
-                "type": "error",
-                **guidance,
-                "command": label,
-                "timeout_seconds": e.timeout,
-            })
+            self._report_timeout(e, "[convert]")
         except (BrokenPipeError, ConnectionResetError, _DrainAbort):
             raise  # do_POST handles these; nothing to report here
         except Exception:
@@ -951,6 +1007,242 @@ class ConvertHandler(BaseHTTPRequestHandler):
             self._safe_terminal_error("Unexpected error during conversion")
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    def _do_finish(self, token, pending, content_length):
+        """Complete a conversion whose download the provider refused, from the
+        book file the user's browser fetched instead (POST /finish)."""
+        fulfillment_xml, creds = pending
+        work_dir = tempfile.mkdtemp(dir=WORK_DIR)
+        adept_dir = os.path.join(work_dir, "adept")
+        try:
+            # The device that fulfilled this book, as it was then. Not the
+            # credential cache: the license is only readable by this device.
+            os.makedirs(adept_dir)
+            for name, data in creds.items():
+                with open(os.path.join(adept_dir, name), "wb") as f:
+                    f.write(data)
+            os.makedirs(os.path.join(work_dir, "meta"))
+            with open(_fulfillment_path(work_dir), "wb") as f:
+                f.write(fulfillment_xml)
+
+            # Spool straight to disk: these can be several hundred MB.
+            upload_path = os.path.join(work_dir, "meta", "upload")
+            remaining = content_length
+            with open(upload_path, "wb") as f:
+                while remaining:
+                    chunk = self.rfile.read(min(UPLOAD_CHUNK, remaining))
+                    if not chunk:
+                        raise ConnectionResetError("upload ended early")
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            print(f"[finish] received {content_length} bytes", flush=True)
+
+            self._send_event({"type": "status", "stage": "prepare",
+                              "message": "Checking the downloaded file"})
+            # Same naming and rights handling as a normal download; only the
+            # network fetch is replaced by the uploaded file.
+            result = self._run(
+                ["acsmdownloader", "--adept-directory", adept_dir,
+                 "--from-file", upload_path, "--fulfillment", _fulfillment_path(work_dir)],
+                cwd=work_dir,
+                timeout=DECRYPT_TIMEOUT,
+            )
+            if self._deliver(result, work_dir, adept_dir, "[finish]"):
+                delete_pending_fulfillment(token)
+
+        except subprocess.CalledProcessError as e:
+            self._log_process_error(e, "[finish]")
+            if e.returncode is not None and e.returncode < 0:
+                self._report_process_error(e)  # crash card, not "wrong file"
+            else:
+                # By far the likeliest cause is the wrong file: another book,
+                # an unfinished download, or an error page saved as the book.
+                # The token stays valid so they can try again with the right one.
+                self._send_event({"type": "error", **WRONG_FILE_GUIDANCE})
+        except subprocess.TimeoutExpired as e:
+            self._report_timeout(e, "[finish]")
+        except (BrokenPipeError, ConnectionResetError, _DrainAbort):
+            raise  # do_POST handles these; nothing to report here
+        except Exception:
+            print("[finish] ERROR: Unexpected exception:", flush=True)
+            traceback.print_exc()
+            self._safe_terminal_error("Unexpected error while finishing the conversion")
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    def _deliver(self, result, work_dir, adept_dir, tag):
+        """Remove the DRM from the book acsmdownloader just produced and send it.
+
+        Shared by /convert and /finish. Returns True once the book was sent.
+        """
+        # acsmdownloader announces what it wrote as `Created <name>`
+        # (acsmdownloader.cpp:119). Everything after that marker is the
+        # name, and it is taken verbatim: it comes from the book's
+        # `dc:title`, so it can legitimately begin or end with spaces.
+        # Stripping it is what broke a title of "   .     " -- we went
+        # looking for ".     .epub" while the file on disk was
+        # "   .     .epub", then handed the missing path to adept_remove,
+        # whose fileCopy() tests `!fd` against an open() that returns -1 on
+        # failure. So it copied nothing, left an empty file, and libzip
+        # rejected it: "Invalid zip file <output>", pointing at the output
+        # for a fault in the input.
+        #
+        # The marker is searched for anywhere in the line rather than
+        # anchored, because libgourou draws its progress meter with a
+        # leading \r and no trailing newline (drmprocessorclientimpl.cpp:164).
+        # It does emit one endl when the transfer ends, so today `Created`
+        # starts its own line -- but a run that skips that endl would
+        # otherwise glue "Download 100%" to the front of the name.
+        output_filename = None
+        for line in result.stdout.splitlines():
+            _, marker, name = line.partition("Created ")
+            if marker and name.lower().endswith((".epub", ".pdf")):
+                output_filename = name
+                break
+
+        if not output_filename:
+            self._send_event({
+                "type": "error",
+                "error": "Could not determine output filename",
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            })
+            return False
+
+        encrypted_path = os.path.join(work_dir, output_filename)
+        if not os.path.exists(encrypted_path):
+            # The name we read back no longer matches what is on disk.
+            # Stop here: passing a missing path to adept_remove reports
+            # "Invalid zip file <output>" instead, which sends anyone
+            # reading the log after the wrong file entirely.
+            print(f"{tag} ERROR: parsed {output_filename!r} but no such file "
+                  f"in {work_dir}: {os.listdir(work_dir)}", flush=True)
+            self._send_event({
+                "type": "error",
+                "error": "Downloaded file not found",
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            })
+            return False
+
+        decrypted_path = os.path.join(work_dir, "decrypted_" + output_filename)
+        enc_size = os.path.getsize(encrypted_path)
+        print(f"{tag} downloaded {output_filename!r} ({enc_size} bytes); removing DRM",
+              flush=True)
+
+        with _decrypt_gate.hold(on_wait=self._queue_notice("decrypt")):
+            self._send_event({"type": "status", "stage": "decrypt",
+                              "message": "Removing DRM"})
+            self._run([
+                "adept_remove",
+                "--adept-directory", adept_dir,
+                "--output-file", decrypted_path,
+                encrypted_path,
+            ], timeout=DECRYPT_TIMEOUT, heartbeat_stage="decrypt")
+
+        content_type = (
+            "application/epub+zip" if output_filename.lower().endswith(".epub")
+            else "application/pdf"
+        )
+        download_name = _download_name(output_filename)
+        out_size = os.path.getsize(decrypted_path)
+        print(f"{tag} Success! Returning {download_name!r} "
+              f"(on disk {output_filename!r}, {out_size} bytes)", flush=True)
+        self._send_file_result(download_name, content_type, decrypted_path)
+        return True
+
+    @staticmethod
+    def _log_process_error(e, tag):
+        label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
+        sig = _signal_name(e.returncode)
+        sig_suffix = f" ({sig})" if sig else ""
+        print(f"{tag} ERROR: {label} failed rc={e.returncode}{sig_suffix}", flush=True)
+        print(f"{tag} stdout: {e.stdout}", flush=True)
+        print(f"{tag} stderr: {e.stderr}", flush=True)
+
+    def _report_process_error(self, e):
+        """Send the error card for a failed tool run."""
+        output = (e.stdout or "") + (e.stderr or "")
+        label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
+        sig = _signal_name(e.returncode)
+        error_code, known = _match_known_error(output)
+        if known:
+            self._send_event({"type": "error", "error_code": error_code, **known})
+        elif e.returncode is not None and e.returncode < 0:
+            # Killed by a signal — empty stdout/stderr is typical.
+            # Render a structured "internal failure" card so the user gets
+            # retry guidance instead of a raw blob, and include
+            # returncode/signal: the page keeps every event line and shows
+            # them under "Show log", so those land in the bug report.
+            self._send_event({
+                "type": "error",
+                **SIGNAL_GUIDANCE,
+                "error_code": f"Internal failure ({sig or 'crash'})",
+                "command": label,
+                "returncode": e.returncode,
+            })
+        else:
+            self._send_event({
+                "type": "error",
+                "error": f"{label} failed (exit {e.returncode})",
+                "command": label,
+                "returncode": e.returncode,
+                "stdout": e.stdout or "",
+                "stderr": e.stderr or "",
+            })
+
+    def _report_timeout(self, e, tag):
+        label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
+        print(f"{tag} ERROR: {label} timed out after {e.timeout}s", flush=True)
+        guidance = TIMEOUT_GUIDANCE.get(label, TIMEOUT_GUIDANCE["_default"])
+        self._safe_terminal_event({
+            "type": "error",
+            **guidance,
+            "command": label,
+            "timeout_seconds": e.timeout,
+        })
+
+    def _offer_browser_download(self, e, work_dir, adept_dir):
+        """On a 429 for the book file itself, hand the download to the user.
+
+        Returns True if the client was sent a `manual_download` event instead
+        of an error. Only the book download qualifies: a 429 on any earlier
+        request (operator auth, Fulfill, ...) means we never got a license, so
+        there is nothing for the user to fetch.
+        """
+        if os.path.basename(e.cmd[0]) != "acsmdownloader" or e.returncode != 1:
+            return False
+        # libgourou appends the request URL (local patch, vendor/README.md).
+        refused = re.search(r"HTTP Error code 429 (\S+)", (e.stdout or "") + (e.stderr or ""))
+        if not refused:
+            return False
+        try:
+            with open(_fulfillment_path(work_dir), "rb") as f:
+                fulfillment_xml = f.read()
+            creds = {}
+            for name in CRED_FILES:
+                with open(os.path.join(adept_dir, name), "rb") as f:
+                    creds[name] = f.read()
+        except OSError:
+            return False  # failed before the fulfill reply was saved
+        download_url = _fulfillment_download_url(fulfillment_xml)
+        if download_url != refused.group(1):
+            print("[convert] 429 was not on the book download; no browser fallback",
+                  flush=True)
+            return False
+        token = save_pending_fulfillment(fulfillment_xml, creds, download_url)
+        if not token:
+            return False
+        provider = _provider_name(download_url)
+        print(f"[convert] 429 on book download ({provider or 'unknown provider'}); "
+              "offering browser download", flush=True)
+        self._send_event({
+            "type": "manual_download",
+            "download_url": download_url,
+            "token": token,
+            "provider": provider,
+        })
+        return True
 
     def _queue_notice(self, stage, abort_on_drain=False):
         """Build the FairGate callback that reports queue progress upstream.
@@ -1080,7 +1372,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
 
     def _send_event(self, obj):
         kind = obj.get("type")
-        if kind in ("result", "error"):
+        if kind in ("result", "error", "manual_download"):
             self._terminal_sent = True
         elif kind == "status":
             self._stage = obj.get("stage", self._stage)
@@ -1133,6 +1425,14 @@ class ConvertHandler(BaseHTTPRequestHandler):
     def _safe_terminal_error(self, message, **extra):
         """Emit a terminal error event, swallowing write failures."""
         self._safe_terminal_event({"type": "error", "error": message, **extra})
+
+    def _discard_body(self, length):
+        """Read and drop a request body we are about to refuse."""
+        while length > 0:
+            chunk = self.rfile.read(min(UPLOAD_CHUNK, length))
+            if not chunk:
+                break
+            length -= len(chunk)
 
     def _json_response(self, status, body):
         data = json.dumps(body).encode()
