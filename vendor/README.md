@@ -10,7 +10,19 @@ forge is required to build the image.
 Upstream: https://forge.soutade.fr/soutade/libgourou.git
 Commit:   324c566 ("Fix help of adept_load_mgt", v0.8.9)
 
-Vendored verbatim (build artifacts excluded: `obj/`, compiled `utils/*` binaries).
+Vendored verbatim (build artifacts excluded: `obj/`, compiled `utils/*` binaries),
+with one local patch:
+
+- `utils/drmprocessorclientimpl.cpp` (`sendRequest`): the `CLIENT_HTTP_ERROR`
+  message carries the request URL, i.e. `HTTP Error code 429 <URL>` instead of
+  `HTTP Error code 429`. A single acsmdownloader run makes several requests
+  (operator `/Auth`, `/InitLicenseService`, `/Fulfill`, `/LicenseServiceInfo`,
+  notify, then the book download), and without the URL a failure can't be tied
+  to one of them. We added it to find out which step Google Play answers with
+  429. `-v` would also log the URLs, but it dumps the whole activation.xml (device
+  pkcs12 and private license key) via `User::updateActivationFile`, so it is
+  not an option. server.py matches these errors by substring
+  (`"HTTP Error code 429"` etc.), so the suffix doesn't affect the error cards.
 
 ## libgourou/lib/updfparser/
 

@@ -330,7 +330,7 @@ std::string DRMProcessorClientImpl::sendHTTPRequest(const std::string& URL, cons
         EXCEPTION(gourou::CLIENT_NETWORK_ERROR, "Error " << curl_easy_strerror(res));
 
     if (http_code >= 400)
-        EXCEPTION(gourou::CLIENT_HTTP_ERROR, "HTTP Error code " << http_code);
+        EXCEPTION(gourou::CLIENT_HTTP_ERROR, "HTTP Error code " << http_code << " " << URL);
 
     if ((downloadedBytes >= DISPLAY_THRESHOLD || replyData.size() >= DISPLAY_THRESHOLD) &&
         gourou::logLevel >= gourou::LG_LOG_WARN)

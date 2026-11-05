@@ -15,7 +15,8 @@ WORKDIR /usr/src
 # Build from vendored sources instead of cloning forge.soutade.fr (which has
 # been unreliable). vendor/libgourou is libgourou @324c566 with its uPDFParser
 # dependency pre-placed at lib/updfparser, so no network access is needed.
-# See vendor/README.md for provenance.
+# It carries one local patch (request URL in HTTP error messages); see
+# vendor/README.md for provenance and the patch.
 COPY vendor/libgourou /usr/src/libgourou
 
 RUN cd /usr/src/libgourou/lib/updfparser \
