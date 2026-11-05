@@ -788,9 +788,8 @@ WRONG_FILE_GUIDANCE = {
             "heading": "Choose the file again",
             "text": (
                 "Look in your Downloads folder for the file that the download "
-                "button just saved (usually an .epub or .pdf named after the "
-                "book) and choose it below. If you're not sure, download it "
-                "again first."
+                "button just saved and choose it below. If you're not sure "
+                "which file it is, download it again first."
             ),
         },
     ],

@@ -47,6 +47,7 @@
     .manual .store-link:hover { background: #2d2d4e; }
     .drop-zone { margin-top: 0.4rem; border: 2px dashed #9aa3d0; border-radius: 6px; padding: 1.25rem; text-align: center; color: #555; cursor: pointer; background: #fff; }
     .drop-zone.dragging { border-color: #1a1a2e; background: #eef1ff; }
+    .pick-error { margin: 0.4rem 0 0; color: #b00020; font-weight: 600; }
     .manual .note { font-size: 0.85rem; color: #666; }
 
     .log-controls { margin-top: 1rem; text-align: left; }
@@ -243,6 +244,10 @@
       status.appendChild(buildManualPanel(ev));
     }
 
+    function isPdfUrl(url) {
+      try { return /\.pdf$/i.test(new URL(url).pathname); } catch (e) { return false; }
+    }
+
     function buildManualPanel(ev) {
       const store = ev.provider || "your bookstore";
       const Store = ev.provider || "Your bookstore";
@@ -256,13 +261,20 @@
         "the conversion. Here's how:</p>" +
         "<ol>" +
         '<li><strong>Download the book</strong><br>' +
-        '<a class="store-link" target="_blank" rel="noopener noreferrer"></a></li>' +
+        '<a class="store-link" target="_blank" rel="noopener noreferrer"></a>' +
+        (isPdfUrl(ev.download_url)
+          ? '<p class="note">If the book opens in a new tab instead of downloading, ' +
+            "save it with the download button in that tab (or Ctrl+S / ⌘+S), " +
+            "then come back here.</p>"
+          : "") +
+        "</li>" +
         '<li><strong>Then choose the file you just downloaded</strong>' +
         '<div class="drop-zone" tabindex="0" role="button">' +
         "Drop the file here, or click to choose it" +
-                // No `accept` filter: we don't control what the store names the
+        // No `accept` filter: we don't control what the store names the
         // file, and on iOS `accept` hides anything that doesn't match.
-        '</div><input type="file" hidden></li>' +
+        '</div><input type="file" hidden>' +
+        '<p class="pick-error" role="alert" hidden></p></li>' +
         "</ol>" +
         '<p class="note">The downloaded file is still DRM-protected and won\'t ' +
         "open in most readers yet. Once you choose it, we'll finish the " +
@@ -274,8 +286,20 @@
 
       const zone = box.querySelector(".drop-zone");
       const input = box.querySelector("input[type=file]");
+      const pickError = box.querySelector(".pick-error");
       const finish = (file) => {
+        input.value = ""; // so choosing the same file again still fires "change"
         if (!file) return;
+        // The ACSM is often the newest file in Downloads (e.g. when the book
+        // opened in a browser tab instead of downloading), so catch it here
+        // rather than uploading it for a generic "wrong file" error.
+        if (/\.acsm$/i.test(file.name)) {
+          pickError.textContent = "That's the .acsm file you started with. " +
+            "Instead, choose the book file you got from the download button in step 1.";
+          pickError.hidden = false;
+          return;
+        }
+        pickError.hidden = true;
         runConversion("/finish?token=" + encodeURIComponent(ev.token), file);
       };
       zone.addEventListener("click", () => input.click());
