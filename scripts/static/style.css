@@ -1,4 +1,6 @@
 * { box-sizing: border-box; }
+/* Rules like `form { display: flex }` would otherwise beat the attribute. */
+[hidden] { display: none !important; }
 body { font-family: system-ui, sans-serif; font-size: 17px; line-height: 1.6; max-width: 660px; margin: 0 auto; padding: 60px 20px; color: #1a1a1a; }
 h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
 h1 a { color: inherit; text-decoration: none; }
