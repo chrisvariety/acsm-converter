@@ -16,11 +16,21 @@
       <h2><span class="step-num">1</span> Download the book</h2>
       <a class="store-link" href="{{ download_url }}" target="_blank" rel="noopener noreferrer">Download from {{ store }}</a>
       {% if is_pdf %}
-      <p class="note">If the book opens in a new tab instead of downloading,
-        the pages may look blank. That's expected: the book is still
-        DRM-protected, and nothing is wrong with it. Save it with the download
-        button in that tab (or Ctrl+S / &#8984;+S), then come back here.</p>
+      <p class="note os-desktop">If the book opens in a new tab instead of
+        downloading, the pages may look blank. That's expected: the book is
+        still DRM-protected, and nothing is wrong with it. Save it with the
+        download button in that tab (or Ctrl+S / &#8984;+S), then come back
+        here.</p>
       {% endif %}
+      <p class="note os-ios">If Safari asks, tap <strong>Download</strong>.
+        If the book opens instead, tap the <strong>Share</strong> button, then
+        <strong>Save to Files</strong>{% if is_pdf %} (the pages may look
+        blank; that's expected, because the book is still DRM-protected){% endif %}.
+        Then come back to this tab.</p>
+      <p class="note os-android">If the book opens in a viewer instead of
+        downloading{% if is_pdf %} (the pages may look blank; that's expected,
+        because the book is still DRM-protected){% endif %}, use its
+        <strong>Download</strong> button. Then come back to this tab.</p>
     </div>
 
     <div class="task">
@@ -29,9 +39,16 @@
       {# No `accept` filter: we don't control what the store names the file,
          and on iOS `accept` hides anything that doesn't match. #}
       <div class="drop-zone" id="drop-zone" tabindex="0" role="button">
-        Drop the file here, or click to choose it
+        <span class="os-desktop">Drop the file here, or click to choose it</span>
+        <span class="os-mobile">Tap here to choose the file</span>
       </div>
       <input type="file" id="file" hidden>
+      <p class="note os-ios">In the menu that appears, tap
+        <strong>Choose File</strong>, then <strong>Recents</strong>: the book
+        should be at the top. If it isn't, tap <strong>Browse</strong> and look
+        in <strong>Downloads</strong>.</p>
+      <p class="note os-android">Pick the newest file in
+        <strong>Downloads</strong> (or <strong>Recent</strong>).</p>
       <p class="note">The downloaded file is still DRM-protected and won't open
         in most readers yet. Once you choose it, we'll finish the conversion.</p>
     </div>

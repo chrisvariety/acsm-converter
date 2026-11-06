@@ -5,6 +5,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}ACSM Converter{% endblock %}</title>
   <link rel="stylesheet" href="/static/style.css">
+  <script>
+    // Tags <html data-os="ios|android|desktop"> so pages can show
+    // platform-specific instructions (.os-ios, .os-android, .os-mobile,
+    // .os-desktop in style.css). Runs before the body renders, so there's no
+    // flash of the wrong text. iPadOS Safari claims to be a Mac, so a Mac
+    // with a touch screen counts as iOS.
+    (function () {
+      var ua = navigator.userAgent;
+      document.documentElement.dataset.os =
+        /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? "ios"
+        : /Android/.test(ua) ? "android"
+        : "desktop";
+    })();
+  </script>
 </head>
 <body>
   <h1><a href="/">ACSM Converter</a></h1>
