@@ -69,6 +69,11 @@ button:disabled { opacity: 0.6; cursor: not-allowed; }
 .log-toggle:hover { background: #333; }
 .log-output { margin-top: 0.75rem; background: #1a1a2e; color: #e0e0e0; padding: 0.75rem 1rem; border-radius: 4px; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
 
+/* Index page counter, in the style of a 1990s hit counter. */
+.hit-counter { margin-top: 3rem; padding: 1.25rem 1rem; text-align: center; color: #333; line-height: 2.2; }.odometer { display: inline-flex; gap: 2px; padding: 3px; margin: 0 0.4rem; background: #000; border: 2px outset #888; vertical-align: middle; line-height: 1; }
+.odometer span { display: inline-block; width: 0.9em; padding: 0.15em 0; background: #111; color: #3f3; font-family: "Courier New", Courier, monospace; font-weight: bold; font-size: 1.3rem; text-align: center; text-shadow: 0 0 4px #3f3; }
+.last-seen { display: block; font-size: 0.95rem; font-style: italic; line-height: 1.4; margin-top: 0.25rem; }
+
 .footer { margin-top: 3rem; padding-top: 2rem; border-top: 1px solid #eee; text-align: center; }
 .footer a { display: inline-block; color: #999; }
 .footer a:hover { color: #1a1a2e; }

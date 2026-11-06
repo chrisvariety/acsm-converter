@@ -16,7 +16,7 @@ The converter manages the credential cache by reading from and writing to Postgr
 scripts/server.py   # Python HTTP server: serves the pages, runs conversions
 scripts/templates/  # Jinja2 page templates (/, /download/<token>, expired link)
 scripts/static/     # CSS and the conversion script the pages share
-scripts/schema.sql  # Postgres schema for the credential cache
+scripts/schema.sql  # Postgres schema: credential cache, pending downloads, conversion stats
 Dockerfile          # Builds libgourou tools + the HTTP server
 fly.toml           # Fly.io configuration
 ```
@@ -44,6 +44,8 @@ psql "$DATABASE_URL" -f scripts/schema.sql
 ```
 
 Caching is optional. If the `DATABASE_URL` is unset, the converter still works. It re-activates a fresh anonymous device on every request.
+
+The same database feeds the counter on the index page ("books converted in the last 24 hours"). Each delivered book adds one row to `conversions` (format, size, time; nothing identifying). Without the table, the page leaves the counter out. To seed it from older logs, see `scripts/backfill_conversions.py`.
 
 ### 2. Deploy
 

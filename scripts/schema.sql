@@ -31,3 +31,16 @@ CREATE TABLE IF NOT EXISTS pending_fulfillments (
 );
 CREATE INDEX IF NOT EXISTS pending_fulfillments_created_at
   ON pending_fulfillments (created_at);
+
+-- One row per book delivered, for the counter on the index page. Deliberately
+-- nothing that identifies the book or the reader: no title, no ACSM, no IP.
+-- `manual` marks books that came through the browser-assisted download
+-- (/finish). If this table is missing, the page simply omits the counter.
+CREATE TABLE IF NOT EXISTS conversions (
+  finished_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  format      TEXT NOT NULL,     -- 'epub', 'pdf', or 'other'
+  size_bytes  BIGINT NOT NULL,   -- the DRM-free file we returned
+  manual      BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS conversions_finished_at
+  ON conversions (finished_at);

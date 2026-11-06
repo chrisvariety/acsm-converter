@@ -462,6 +462,83 @@ def delete_pending_fulfillment(token):
         print(f"[pending] delete failed: {e}", flush=True)
 
 
+# The index page's counter: books delivered in the last 24h, and how long ago
+# the latest one was. Read from Postgres at most once per STATS_TTL per
+# machine, so traffic to "/" never turns into database load. Every machine
+# writes to the same table, so the count covers all of them.
+STATS_TTL = 60
+_stats_lock = threading.Lock()
+# -inf, not 0: monotonic() can itself be near 0 on a freshly booted machine.
+_stats = {"fetched": float("-inf"), "count": None, "last_at": None}
+
+
+def record_conversion(filename, size_bytes, manual):
+    """Count one delivered book. Best-effort: never fails a conversion."""
+    if not _caching_enabled():
+        return
+    ext = os.path.splitext(filename)[1].lower()
+    fmt = {".epub": "epub", ".pdf": "pdf"}.get(ext, "other")
+    try:
+        with closing(psycopg2.connect(DATABASE_URL, connect_timeout=3)) as conn:
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO conversions (format, size_bytes, manual) "
+                    "VALUES (%s, %s, %s)",
+                    (fmt, size_bytes, manual),
+                )
+    except Exception as e:
+        print(f"[stats] record failed: {e}", flush=True)
+        return
+    # Show our own conversions straight away rather than after the next
+    # refresh; other machines' ones arrive within STATS_TTL.
+    with _stats_lock:
+        if _stats["count"] is not None:
+            _stats["count"] += 1
+            _stats["last_at"] = time.time()
+
+
+def conversion_stats():
+    """{"count", "last_at"} for the index page, or None if unavailable.
+
+    Serves the cached figures while one thread refreshes them, so a slow or
+    unreachable database delays at most one page view per STATS_TTL.
+    """
+    if not _caching_enabled():
+        return None
+    with _stats_lock:
+        stale = time.monotonic() - _stats["fetched"] > STATS_TTL
+        if stale:
+            _stats["fetched"] = time.monotonic()  # claim the refresh
+    if stale:
+        try:
+            with closing(psycopg2.connect(DATABASE_URL, connect_timeout=2)) as conn, \
+                    conn.cursor() as cur:
+                cur.execute(
+                    "SELECT (SELECT count(*) FROM conversions "
+                    "        WHERE finished_at > NOW() - INTERVAL '24 hours'), "
+                    "       (SELECT extract(epoch FROM max(finished_at)) "
+                    "        FROM conversions)")
+                count, last_at = cur.fetchone()
+            with _stats_lock:
+                _stats["count"] = count
+                _stats["last_at"] = float(last_at) if last_at is not None else None
+        except Exception as e:
+            print(f"[stats] read failed: {e}", flush=True)
+    with _stats_lock:
+        if _stats["count"] is None or _stats["last_at"] is None:
+            return None
+        return {"count": _stats["count"], "last_at": _stats["last_at"]}
+
+
+def _time_ago(seconds):
+    """'just now', '4 minutes ago', '2 hours ago', ..."""
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds >= size:
+            n = int(seconds // size)
+            return f"{n} {unit}{'' if n == 1 else 's'} ago"
+    return "just now"
+
+
 def _fulfillment_download_url(fulfillment_xml):
     """The book's download URL from a fulfill reply, or None."""
     try:
@@ -876,7 +953,13 @@ class ConvertHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/":
-            self._page(200, "index.html")
+            stats = conversion_stats()
+            self._page(200, "index.html", counter=stats and {
+                # Zero-padded like an old hit counter, one cell per digit.
+                "digits": f"{stats['count']:07d}",
+                "count": stats["count"],
+                "ago": _time_ago(max(0, time.time() - stats["last_at"])),
+            })
             return
         if path.startswith("/download/"):
             self._download_page(path[len("/download/"):])
@@ -1220,6 +1303,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
         print(f"{tag} Success! Returning {download_name!r} "
               f"(on disk {output_filename!r}, {out_size} bytes)", flush=True)
         self._send_file_result(download_name, content_type, decrypted_path)
+        record_conversion(output_filename, out_size, manual=(tag == "[finish]"))
         return True
 
     @staticmethod

@@ -36,6 +36,16 @@
       <p>Files are processed in memory and discarded immediately. We don't keep your books or your data.</p>
     </div>
   </div>
+
+  {% if counter %}
+  <div class="hit-counter">
+    Books converted in the last 24 hours:
+    <span class="odometer" role="img" aria-label="{{ counter.count }}">
+      {%- for d in counter.digits %}<span aria-hidden="true">{{ d }}</span>{% endfor -%}
+    </span>
+    <span class="last-seen">Last conversion: {{ counter.ago }}</span>
+  </div>
+  {% endif %}
 {% endblock %}
 
 {% block scripts %}
