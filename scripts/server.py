@@ -57,6 +57,17 @@ for _name in sorted(os.listdir(os.path.join(_HERE, "static"))):
         with open(os.path.join(_HERE, "static", _name), "rb") as _f:
             STATIC_FILES["/static/" + _name] = (_f.read(), _type)
 
+
+def _static_url(name):
+    """URL for a static file, versioned by its content. Cloudflare rewrites our
+    Cache-Control to a multi-hour browser TTL, so without this a deploy keeps
+    serving the old CSS/JS from browser caches; a changed file gets a new URL."""
+    data, _ = STATIC_FILES["/static/" + name]
+    return f"/static/{name}?v={hashlib.sha256(data).hexdigest()[:10]}"
+
+
+TEMPLATES.globals["static_url"] = _static_url
+
 CRED_FILES = ("device.xml", "activation.xml", "devicesalt")
 
 # Hard ceilings so a stalled provider connection can't hang the request

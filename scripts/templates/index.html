@@ -49,7 +49,7 @@
 {% endblock %}
 
 {% block scripts %}
-  <script src="/static/convert.js"></script>
+  <script src="{{ static_url('convert.js') }}"></script>
   <script>
     const form = document.getElementById("form");
     const status = document.getElementById("status");

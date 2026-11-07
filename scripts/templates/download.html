@@ -59,7 +59,7 @@
 {% endblock %}
 
 {% block scripts %}
-  <script src="/static/convert.js"></script>
+  <script src="{{ static_url('convert.js') }}"></script>
   <script>
     const TOKEN = {{ token|tojson }};
     const steps = document.getElementById("steps");
