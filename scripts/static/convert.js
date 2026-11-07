@@ -80,6 +80,7 @@ async function runConversion(url, body, opts) {
       saveBook(payload.parts, resultEvent);
       setStatus(status, "Done! Your file is downloading.");
       status.className = "done";
+      showDonate(status);
       return "done";
     }
     if (manualEvent) {
@@ -276,6 +277,18 @@ function showLogControls(status, showSupport, eventLog) {
   }
 
   status.appendChild(controls);
+}
+
+// A gentle, optional ask once the book is safely on its way.
+function showDonate(status) {
+  const box = document.createElement("div");
+  box.className = "donate";
+  box.innerHTML =
+    '<p><strong>Did it work? Great!</strong> To help with hosting and ' +
+    "development costs, you can optionally buy me a coffee on Ko-fi.</p>" +
+    '<a class="donate-link" href="https://ko-fi.com/chrisvariety" target="_blank" rel="noopener">' +
+    '<span class="donate-heart" aria-hidden="true">&#9829;</span> Donate on Ko-fi</a>';
+  status.appendChild(box);
 }
 
 function esc(s) {
