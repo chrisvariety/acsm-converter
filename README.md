@@ -1,85 +1,48 @@
 # ACSM Converter
 
-A web app that converts ACSM files to standard EPUB/PDF files, powered by [libgourou](https://forge.soutade.fr/soutade/libgourou). It runs entirely on [Fly.io](https://fly.io/): one small Python server serves the upload page and does the conversion.
+A humble little file format converter. In goes `.acsm`, out comes `.epub` or `.pdf`. That doesn't sound like much, but it's a wee bit tricky to do correctly, and somehow we're pushing ~1000 books per day over on free hosted version available at [acsm-converter.com](https://www.acsm-converter.com).
 
-## How it works
+## What's an ACSM anyway?
 
-1. User uploads an `.acsm` file through the web interface
-2. The converter looks up cached Adobe credentials for the file's `userId` in Postgres (activating a fresh anonymous device and caching it if there's no hit), downloads the book, and converts it to the final EPUB/PDF
-3. Progress is streamed back as newline-delimited JSON (NDJSON) events, and the finished EPUB/PDF follows the terminal `result` event as raw bytes on the same connection
+You likely just bought a book from your local library or online bookstore. You want to read it on your e-reader, so you click download, but you don't end up with an EPUB or PDF... you end up with an ACSM file. Great, what now? If you're particularly tech-y, there's a variety of ways to convert it to a standard EPUB/PDF file.
 
-The converter manages the credential cache by reading from and writing to Postgres.
+But if you just want to read the book, that's why we're here: just upload the ACSM file and click the "convert" button and we'll do the rest.
 
-## Project structure
+## The technical details
 
-```
-scripts/server.py   # Python HTTP server: serves the pages, runs conversions
-scripts/templates/  # Jinja2 page templates (/, /download/<token>, expired link)
-scripts/static/     # CSS and the conversion script the pages share
-scripts/schema.sql  # Postgres schema: credential cache, pending downloads, conversion stats
-Dockerfile          # Builds libgourou tools + the HTTP server
-fly.toml           # Fly.io configuration
-```
+Credit where credit is due: this wouldn't be possible without [libgourou](https://forge.soutade.fr/soutade/libgourou) by Soutade, a free implementation of Adobe's ADEPT protocol. This is pretty much a thin, hosted wrapper around it.
 
-## Development
+The thing is, that ACSM file you have isn't the book, it's more of a "ticket" you can use to exchange for the actual book. When you upload one, we:
 
-```bash
-docker build -t acsm-converter .
-docker run --rm -p 8080:8080 acsm-converter
-```
+1. Activate a device: Adobe wants every book tied to a registered "device", so we register an anonymous one on your behalf and tie it to your `userId`.
+2. Fulfill and download: We hand the "ticket" to the bookstore, hopefully get a license back, and download the book.
+3. Convert: Finally, we turn the book into a standard EPUB/PDF that most any e-reader can open.
 
-Then open http://localhost:8080.
+## Running it yourself
 
-## Deployment
+If you're just looking to convert your ACSM files, you've read too far. Just upload your ACSM file to [acsm-converter.com](https://www.acsm-converter.com/) and click the "convert" button.
 
-The converter runs on Fly.io rather than Cloudflare, because Cloudflare's shared egress IPs hit rate limits from content providers (e.g. Google Play's `acs4_book_bytes` endpoint).
+If you are a developer and want to run this yourself, you'll need:
 
-### 1. Provision Postgres and apply the schema
+1. A Postgres database
+2. Somewhere to host a Docker container (e.g. [Fly.io](https://fly.io/))
 
-The container caches Adobe credentials in Postgres. Any reachable Postgres works (Fly Postgres, Neon, Supabase, ...):
+Set up the database first (any Postgres will do: Neon, Supabase, Fly, one on your laptop...):
 
 ```bash
-flyctl postgres create            # or use an existing database
 psql "$DATABASE_URL" -f scripts/schema.sql
 ```
 
-Caching is optional. If the `DATABASE_URL` is unset, the converter still works. It re-activates a fresh anonymous device on every request.
-
-The same database feeds the counter on the index page ("books converted in the last 24 hours"). Each delivered book adds one row to `conversions` (format, size, time; nothing identifying). Without the table, the page leaves the counter out. To seed it from older logs, see `scripts/backfill_conversions.py`.
-
-### 2. Deploy
+Then build and run the container, pointing it at the database:
 
 ```bash
-flyctl launch --no-deploy   # accept the existing fly.toml; pick an app name + region
-flyctl secrets set DATABASE_URL="postgres://..."   # from step 1
-flyctl deploy
+docker build -t acsm-converter .
+docker run --rm -p 8080:8080 -e DATABASE_URL="postgres://..." acsm-converter
 ```
 
-To change how many downloads run at once, set `MAX_CONCURRENT_DOWNLOADS` in the `[env]` block of `fly.toml` (default 4). To handle more traffic than a single machine can process, run `flyctl scale count 2` - `fly.toml` is already configured to route requests safely across machines and to drain in-flight conversions on shutdown.
+Open http://localhost:8080 and you should be all set. If Postgres is running on your own machine, use `host.docker.internal` rather than `localhost` in the URL, since the container has its own `localhost`.
 
-### 3. Custom domain
+A couple of other knobs you can fiddle with via environment variables:
 
-DNS for `acsm-converter.com` is on Cloudflare, proxied in front of Fly:
-
-```bash
-flyctl certs add www.acsm-converter.com
-```
-
-- `www`: proxied CNAME to `<app>.fly.dev`, plus the `_acme-challenge` CNAME that
-  `flyctl certs` asks for (Fly can't validate through the proxy otherwise)
-- SSL/TLS mode: **Full (strict)** (Flexible loops forever against `force_https`)
-- Bare domain: a proxied placeholder record and a Cloudflare Redirect Rule sending it
-  to `https://www.acsm-converter.com` (path and query preserved)
-
-## Known error codes
-
-The app provides user-friendly guidance for common ACSM errors:
-
-- **E_LIC_ALREADY_FULFILLED_BY_ANOTHER_USER** - the file was already opened by a different device/account
-- **E_GOOGLE_DEVICE_LIMIT_REACHED** - too many devices registered (Google Play books)
-- **E_ADEPT_REQUEST_EXPIRED** - the ACSM file has expired
-- **E_LIC_LICENSE_SIGN_ERROR** - a temporary issue on the content provider's end
-
-## Credits
-
-Built on [libgourou](https://forge.soutade.fr/soutade/libgourou) by Soutade, a free implementation of Adobe's ADEPT protocol.
+- `MAX_CONCURRENT_DOWNLOADS`: how many conversions run at once (default `4`)
+- `WORK_DIR`: scratch space for books mid-conversion (default `/home/libgourou/work`)
