@@ -63,6 +63,9 @@
       // stays away afterwards, so the only next steps on screen are the ones
       // that apply (pressing Convert again on a refused download just gets
       // refused again). "Convert another file" reloads to start over.
+      // Show the status in the same frame the form disappears; otherwise the
+      // page collapses while the file is read, before runConversion sets it.
+      status.textContent = "Uploading...";
       form.hidden = true;
       const outcome = await runConversion("/convert", await file.arrayBuffer(), {
         status: status,
