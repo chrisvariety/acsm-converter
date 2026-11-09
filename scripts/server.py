@@ -484,11 +484,18 @@ _stats = {"fetched": float("-inf"), "count": None, "last_at": None}
 
 
 def record_conversion(filename, size_bytes, manual):
-    """Count one delivered book. Best-effort: never fails a conversion."""
-    if not _caching_enabled():
-        return
+    """Count one delivered book. Best-effort: never fails a conversion.
+
+    Also logs a `[done]` line, the success counterpart of `log_error`'s
+    `[error]` line, so a log backend can compute error rates without the
+    database. Same rule as the table: nothing identifying the book or reader.
+    """
     ext = os.path.splitext(filename)[1].lower()
     fmt = {".epub": "epub", ".pdf": "pdf"}.get(ext, "other")
+    print(f"[done] format={fmt} size={size_bytes} manual={str(manual).lower()}",
+          flush=True)
+    if not _caching_enabled():
+        return
     try:
         with closing(psycopg2.connect(DATABASE_URL, connect_timeout=3)) as conn:
             with conn, conn.cursor() as cur:
@@ -942,6 +949,47 @@ def _match_known_error(output):
     return None, None
 
 
+def _error_token(code):
+    """A KNOWN_ERRORS key as a single space-free token for the log line."""
+    m = re.fullmatch(r"HTTP Error code (\d+)", code)
+    return f"HTTP_{m.group(1)}" if m else re.sub(r"\W+", "_", code).strip("_")
+
+
+def _classify_error(output, returncode):
+    """(code, known) for a failed tool run, for `log_error`.
+
+    `known` means the code is in KNOWN_ERRORS, i.e. somewhat expected. An
+    Adobe `E_*` code we have no entry for is still extracted, so a new one
+    (e.g. E_ADEPT_RESET_PW_REQUIRED) shows up under its own name rather than
+    as "unknown".
+    """
+    code, guidance = _match_known_error(output)
+    if guidance:
+        return _error_token(code), True
+    m = re.search(r"\bE_[A-Z0-9_]+", output)
+    if m:
+        return m.group(0), False
+    m = re.search(r"HTTP Error code (\d+)", output)
+    if m:
+        return f"HTTP_{m.group(1)}", False
+    sig = _signal_name(returncode)
+    if sig:
+        return re.sub(r"\W+", "_", sig), False
+    return "unknown", False
+
+
+def log_error(tag, command, code, known, returncode=None):
+    """One structured line per failed conversion, for log-based alerting.
+
+    Format: `[error] flow=convert command=acsmdownloader code=E_FOO known=false rc=1`.
+    Only the code, never tool output: stdout can carry the book's title and
+    download URL, and this line is meant to be shipped off-box.
+    """
+    rc = "" if returncode is None else f" rc={returncode}"
+    print(f"[error] flow={tag.strip('[]')} command={command} code={code} "
+          f"known={str(known).lower()}{rc}", flush=True)
+
+
 def _download_name(filename):
     """A name the browser can sensibly save the book under.
 
@@ -1169,6 +1217,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
             # propagate and close the socket silently — surface it instead.
             print("[convert] ERROR: Unexpected exception during conversion:", flush=True)
             traceback.print_exc()
+            log_error("[convert]", "server", "exception", False)
             self._safe_terminal_error("Unexpected error during conversion")
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -1216,8 +1265,12 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 delete_pending_fulfillment(token)
 
         except subprocess.CalledProcessError as e:
-            self._log_process_error(e, "[finish]")
-            if e.returncode is not None and e.returncode < 0:
+            crashed = e.returncode is not None and e.returncode < 0
+            # A non-crash failure here gets the wrong-file card below, so log
+            # it as that rather than as whatever the tool happened to print.
+            self._log_process_error(e, "[finish]",
+                                    None if crashed else ("wrong_file", True))
+            if crashed:
                 self._report_process_error(e)  # crash card, not "wrong file"
             else:
                 # By far the likeliest cause is the wrong file: another book,
@@ -1231,6 +1284,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
         except Exception:
             print("[finish] ERROR: Unexpected exception:", flush=True)
             traceback.print_exc()
+            log_error("[finish]", "server", "exception", False)
             self._safe_terminal_error("Unexpected error while finishing the conversion")
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -1266,6 +1320,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 break
 
         if not output_filename:
+            log_error(tag, "acsmdownloader", "no_output_filename", False)
             self._send_event({
                 "type": "error",
                 "error": "Could not determine output filename",
@@ -1282,6 +1337,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
             # reading the log after the wrong file entirely.
             print(f"{tag} ERROR: parsed {output_filename!r} but no such file "
                   f"in {work_dir}: {os.listdir(work_dir)}", flush=True)
+            log_error(tag, "acsmdownloader", "output_file_missing", False)
             self._send_event({
                 "type": "error",
                 "error": "Downloaded file not found",
@@ -1318,13 +1374,18 @@ class ConvertHandler(BaseHTTPRequestHandler):
         return True
 
     @staticmethod
-    def _log_process_error(e, tag):
+    def _log_process_error(e, tag, classified=None):
+        """Log a failed tool run. `classified` overrides `_classify_error`
+        with a (code, known) pair when the caller knows better."""
         label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
         sig = _signal_name(e.returncode)
         sig_suffix = f" ({sig})" if sig else ""
         print(f"{tag} ERROR: {label} failed rc={e.returncode}{sig_suffix}", flush=True)
         print(f"{tag} stdout: {e.stdout}", flush=True)
         print(f"{tag} stderr: {e.stderr}", flush=True)
+        code, known = classified or _classify_error(
+            (e.stdout or "") + (e.stderr or ""), e.returncode)
+        log_error(tag, label, code, known, e.returncode)
 
     def _report_process_error(self, e):
         """Send the error card for a failed tool run."""
@@ -1360,6 +1421,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
     def _report_timeout(self, e, tag):
         label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
         print(f"{tag} ERROR: {label} timed out after {e.timeout}s", flush=True)
+        log_error(tag, label, "timeout", True)
         guidance = TIMEOUT_GUIDANCE.get(label, TIMEOUT_GUIDANCE["_default"])
         self._safe_terminal_event({
             "type": "error",
