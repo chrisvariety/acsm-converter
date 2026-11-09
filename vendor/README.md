@@ -39,6 +39,19 @@ with these local patches:
   not an option. server.py matches these errors by substring
   (`"HTTP Error code 429"` etc.), so the suffix doesn't affect the error cards.
 
+- Backported from upstream 4e1ccfc ("Fix memory management errors"), only
+  this hunk: `DRMProcessor::fulfill()` appends a NUL to the fulfill reply
+  before `pugi::xml_document::load_string()`. The reply `ByteArray` is built
+  from a `std::string` without its terminator, so `load_string` read past the
+  end of the heap buffer (heap-buffer-overflow under ASan) on every fulfill,
+  right after `/Fulfill` has spent the single-use token.
+
+- Backported from upstream 4e1ccfc, only this hunk: `parseDateTime()` zeroes
+  its `struct tm` before `strptime()`. Left uninitialised, `tm_isdst` held
+  stack garbage; when positive, glibc's `mktime()` in our UTC container
+  returns -1, so `fulfill()` logged "WARNING: ACSM file expired (...)" for
+  ACSMs that had not expired.
+
 ## libgourou/lib/updfparser/
 
 libgourou's `scripts/setup.sh` normally clones uPDFParser into `lib/updfparser`

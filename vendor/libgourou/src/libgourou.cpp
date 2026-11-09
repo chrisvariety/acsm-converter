@@ -76,6 +76,7 @@ namespace gourou
     static time_t parseDateTime(const char* datetimeString, const char* format)
     {
         struct tm tmStruct;
+        memset(&tmStruct, 0, sizeof(tmStruct));
         strptime(datetimeString, format, &tmStruct);
         return mktime(&tmStruct);
     }
@@ -585,6 +586,9 @@ namespace gourou
                 throw e;
             }
         }
+
+        // Needed for fulfillReply.load_string
+        replyData.append('\0');
 
         pugi::xml_document fulfillReply;
 
