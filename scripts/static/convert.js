@@ -233,11 +233,14 @@ function showKnownError(status, err, eventLog) {
   status.innerHTML = html;
   status.className = "";
   // E_* codes are well-understood provider/account errors with self-service
-  // fixes above, and transient:true marks upstream outages that clear on
-  // their own -- neither group warrants an issue. Everything else
-  // (timeouts, crashes, rate limits, unknowns) is worth flagging to me.
+  // fixes above, transient:true marks upstream outages that clear on their
+  // own, and user_fixable:true marks a user mistake the card explains (e.g.
+  // uploading the book instead of the .acsm) -- none of these warrant an
+  // issue. Everything else (timeouts, crashes, rate limits, unknowns) is
+  // worth flagging to me.
   const isExpected =
-    err.transient === true || (err.error_code && err.error_code.startsWith("E_"));
+    err.transient === true || err.user_fixable === true ||
+    (err.error_code && err.error_code.startsWith("E_"));
   showLogControls(status, !isExpected, eventLog);
 }
 

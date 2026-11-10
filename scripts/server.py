@@ -104,6 +104,12 @@ HEARTBEAT_INTERVAL = 15
 RESULT_CHUNK = 3 * 1024 * 1024
 # Read size when spooling an uploaded book (POST /finish) to disk.
 UPLOAD_CHUNK = 1024 * 1024
+# POST /convert reads the ACSM into memory, so its size must be bounded: an
+# unchecked Content-Length let one upload (or a few concurrently) OOM the machine.
+# Real ACSMs are a few KB; anything bigger is a mistaken book upload or abuse.
+MAX_ACSM_BYTES = 1024 * 1024
+# Keep only the first SNIFF_BYTES of an oversized upload to identify its type.
+SNIFF_BYTES = 1024
 # How long a refused download can be finished via POST /finish. A Google
 # download link still worked when opened by hand some minutes after its 429;
 # its real lifetime is unknown. A day covers a user who wandered off and
@@ -925,6 +931,78 @@ WRONG_FILE_GUIDANCE = {
     ],
 }
 
+# POST /convert only: the upload is a book, not an ACSM. Logs from Nov 2026
+# showed about 1% of uploads were 1-36 MB files that libgourou rejected as
+# "Invalid ACSM file", i.e. people uploading the (still-encrypted) book file
+# itself. Not used by /finish, where uploading the book is the whole point.
+_NOT_ACSM_KINDS = {"epub": "an EPUB (or ZIP)", "pdf": "a PDF"}
+
+
+def _not_acsm_guidance(kind):
+    return {
+        "error_code": f"Not an ACSM file ({kind.upper()})",
+        "user_fixable": True,
+        "title": "That's a book file, not an .acsm file",
+        "description": (
+            f"The file you chose is {_NOT_ACSM_KINDS[kind]} file. This converter "
+            "needs the small .acsm file (usually only a few KB) that your "
+            "library or bookstore gives you in place of the book. A book file "
+            "downloaded through Adobe Digital Editions or a similar app is "
+            "still DRM-protected, and it can't be converted here without its "
+            ".acsm file."
+        ),
+        "solutions": [
+            {
+                "heading": "Upload the .acsm file instead",
+                "text": (
+                    "Go back to your library or bookstore and download the book "
+                    "again. The file you get ends in .acsm; choose that one "
+                    "here."
+                ),
+            },
+            {
+                "heading": "Check whether it already opens",
+                "text": (
+                    "If this file already opens in your e-reader app, it has no "
+                    "DRM and doesn't need converting."
+                ),
+            },
+        ],
+    }
+
+
+# POST /convert: over MAX_ACSM_BYTES and not recognizably a book either.
+TOO_LARGE_GUIDANCE = {
+    "error_code": "File too large",
+    "user_fixable": True,
+    "title": "That file is too large to be an .acsm file",
+    "description": (
+        "An .acsm file is a small download (usually only a few KB) that your "
+        "library or bookstore gives you in place of the book. The file you "
+        "chose is bigger than that, so it's probably the incorrect file."
+    ),
+    "solutions": [
+        {
+            "heading": "Upload the .acsm file instead",
+            "text": (
+                "Go back to your library or bookstore and download the book "
+                "again. The file you get ends in .acsm; choose that one here."
+            ),
+        },
+    ],
+}
+
+
+def _sniff_not_acsm(body):
+    """'epub' or 'pdf' if the upload is plainly a book rather than an ACSM
+    (an XML document), else None. Only the leading magic bytes are read."""
+    head = body[:1024].lstrip()
+    if head.startswith(b"PK\x03\x04"):
+        return "epub"
+    if head.startswith(b"%PDF-"):
+        return "pdf"
+    return None
+
 
 def _signal_name(returncode):
     """Name of the signal that killed a subprocess, or None for normal exits.
@@ -955,27 +1033,69 @@ def _error_token(code):
     return f"HTTP_{m.group(1)}" if m else re.sub(r"\W+", "_", code).strip("_")
 
 
+# libgourou's own exception codes (vendor/libgourou/include/libgourou_common.h),
+# printed as "Exception code : 0x1101". Named so a failure that isn't an Adobe
+# E_* code still gets a useful code in the [error] log line.
+LIBGOUROU_ERRORS = {
+    0x1000: "GOUROU_DEVICE_DOES_NOT_MATCH", 0x1001: "GOUROU_INVALID_CLIENT", 0x1002: "GOUROU_TAG_NOT_FOUND", 0x1003: "GOUROU_ADEPT_ERROR", 0x1004: "GOUROU_FILE_ERROR", 0x1005: "GOUROU_INVALID_PROPERTY",
+    0x1100: "FF_ACSM_FILE_NOT_EXISTS", 0x1101: "FF_INVALID_ACSM_FILE", 0x1102: "FF_NO_HMAC_IN_ACSM_FILE", 0x1103: "FF_NOT_ACTIVATED", 0x1104: "FF_NO_OPERATOR_URL", 0x1105: "FF_SERVER_INTERNAL_ERROR",
+    0x1200: "DW_NO_ITEM", 0x1201: "DW_NO_EBX_HANDLER",
+    0x1300: "SIGN_INVALID_CREDENTIALS",
+    0x1400: "ACTIVATE_NOT_SIGNEDIN",
+    0x2000: "DEV_MKPATH", 0x2001: "DEV_MAC_ERROR", 0x2002: "DEV_INVALID_DEVICE_FILE", 0x2003: "DEV_INVALID_DEVICE_KEY_FILE", 0x2004: "DEV_INVALID_DEV_PROPERTY",
+    0x3000: "USER_MKPATH", 0x3001: "USER_INVALID_ACTIVATION_FILE", 0x3002: "USER_NO_AUTHENTICATION_URL", 0x3003: "USER_NO_PROPERTY", 0x3004: "USER_INVALID_INPUT",
+    0x4000: "FFI_INVALID_FULFILLMENT_DATA", 0x4001: "FFI_INVALID_LOAN_TOKEN",
+    0x5000: "CLIENT_BAD_PARAM", 0x5001: "CLIENT_INVALID_PKCS12", 0x5002: "CLIENT_INVALID_CERTIFICATE", 0x5003: "CLIENT_NO_PRIV_KEY", 0x5004: "CLIENT_NO_PUB_KEY", 0x5005: "CLIENT_RSA_ERROR", 0x5006: "CLIENT_BAD_CHAINING", 0x5007: "CLIENT_BAD_KEY_SIZE", 0x5008: "CLIENT_BAD_ZIP_FILE", 0x5009: "CLIENT_ZIP_ERROR", 0x500a: "CLIENT_GENERIC_EXCEPTION", 0x500b: "CLIENT_NETWORK_ERROR", 0x500c: "CLIENT_INVALID_PKCS8", 0x500d: "CLIENT_FILE_ERROR", 0x500e: "CLIENT_OSSL_ERROR", 0x500f: "CLIENT_CRYPT_ERROR", 0x5010: "CLIENT_DIGEST_ERROR", 0x5011: "CLIENT_HTTP_ERROR",
+    0x6000: "DRM_ERR_ENCRYPTION_KEY", 0x6001: "DRM_VERSION_NOT_SUPPORTED", 0x6002: "DRM_FILE_ERROR", 0x6003: "DRM_FORMAT_NOT_SUPPORTED", 0x6004: "DRM_IN_OUT_EQUALS", 0x6005: "DRM_MISSING_PARAMETER", 0x6006: "DRM_INVALID_KEY_SIZE", 0x6007: "DRM_ERR_ENCRYPTION_KEY_FP", 0x6008: "DRM_INVALID_USER",
+}
+
+
+# Error codes (as `_error_code` names them) that are expected but get no
+# KNOWN_ERRORS card: they log known=true so the "unknown error" alert stays
+# quiet, while the user still sees the raw error. Each needs a reason.
+IGNORED_ERRORS = {
+    # Upload isn't parseable XML. Books uploaded by mistake are caught earlier
+    # (_sniff_not_acsm); what's left is the odd empty or truncated file.
+    "FF_INVALID_ACSM_FILE",
+}
+
+
 def _classify_error(output, returncode):
     """(code, known) for a failed tool run, for `log_error`.
 
-    `known` means the code is in KNOWN_ERRORS, i.e. somewhat expected. An
-    Adobe `E_*` code we have no entry for is still extracted, so a new one
-    (e.g. E_ADEPT_RESET_PW_REQUIRED) shows up under its own name rather than
-    as "unknown".
+    `known` means somewhat expected: the code is in KNOWN_ERRORS (and the user
+    got a card for it) or in IGNORED_ERRORS.
     """
     code, guidance = _match_known_error(output)
     if guidance:
         return _error_token(code), True
+    code = _error_code(output, returncode)
+    return code, code in IGNORED_ERRORS
+
+
+def _error_code(output, returncode):
+    """Best single-token name for a failure with no KNOWN_ERRORS entry.
+
+    An Adobe `E_*` code is still extracted, so a new one (e.g.
+    E_ADEPT_RESET_PW_REQUIRED) shows up under its own name rather than as
+    "unknown". Failing that, libgourou's own exception code is named (e.g.
+    FF_INVALID_ACSM_FILE); it's checked after E_* and HTTP because those
+    arrive wrapped in a generic one (GOUROU_ADEPT_ERROR, CLIENT_HTTP_ERROR).
+    """
     m = re.search(r"\bE_[A-Z0-9_]+", output)
     if m:
-        return m.group(0), False
+        return m.group(0)
     m = re.search(r"HTTP Error code (\d+)", output)
     if m:
-        return f"HTTP_{m.group(1)}", False
+        return f"HTTP_{m.group(1)}"
+    m = re.search(r"Exception code : 0x([0-9a-fA-F]+)", output)
+    if m:
+        n = int(m.group(1), 16)
+        return LIBGOUROU_ERRORS.get(n, f"LIBGOUROU_0x{n:x}")
     sig = _signal_name(returncode)
     if sig:
-        return re.sub(r"\W+", "_", sig), False
-    return "unknown", False
+        return re.sub(r"\W+", "_", sig)
+    return "unknown"
 
 
 def log_error(tag, command, code, known, returncode=None):
@@ -1087,7 +1207,16 @@ class ConvertHandler(BaseHTTPRequestHandler):
             self._json_response(503, {"error": "Server is shutting down; please retry"})
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            content_length = -1
+        if content_length < 0:
+            # Can't drain a body of unknown length; refuse and let it close.
+            # (A negative length must never reach rfile.read: read(-1) reads
+            # until the client hangs up, however much that is.)
+            self._json_response(400, {"error": "Invalid Content-Length"})
+            return
         if content_length == 0:
             self._json_response(400, {"error": "Empty request body"})
             return
@@ -1106,6 +1235,16 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 return
             print(f"[finish] Receiving {content_length} bytes", flush=True)
             work = lambda: self._do_finish(token, pending, content_length)
+        elif content_length > MAX_ACSM_BYTES:
+            # Keep the head for _sniff_not_acsm and drop the rest as it
+            # arrives, so memory stays flat however big the upload. It's read
+            # to the end before replying: replying mid-upload makes browsers
+            # show a bare network error instead of the card.
+            head = self.rfile.read(SNIFF_BYTES)
+            self._discard_body(content_length - len(head))
+            print(f"[convert] Received {content_length} bytes "
+                  f"(over the {MAX_ACSM_BYTES}-byte limit; kept {len(head)})", flush=True)
+            work = lambda: self._do_convert(head, oversized=True)
         else:
             body = self.rfile.read(content_length)
             print(f"[convert] Received {content_length} bytes", flush=True)
@@ -1166,7 +1305,21 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 print("[convert] No terminal event sent; emitting fallback error", flush=True)
                 self._safe_terminal_error("Conversion ended unexpectedly without a result")
 
-    def _do_convert(self, body):
+    def _do_convert(self, body, oversized=False):
+        """`oversized`: the upload was over MAX_ACSM_BYTES and `body` is only
+        its first SNIFF_BYTES."""
+        # Before any work: a book uploaded in place of the ACSM would otherwise
+        # activate a device for nothing and fail with a raw libgourou error.
+        kind = _sniff_not_acsm(body)
+        if kind:
+            print(f"[convert] upload is {kind}, not an ACSM", flush=True)
+            log_error("[convert]", "upload", f"not_acsm_{kind}", True)
+            self._send_event({"type": "error", **_not_acsm_guidance(kind)})
+            return
+        if oversized:
+            log_error("[convert]", "upload", "too_large", True)
+            self._send_event({"type": "error", **TOO_LARGE_GUIDANCE})
+            return
         work_dir = tempfile.mkdtemp(dir=WORK_DIR)
         # This request's own credential directory. Keeping it per-request
         # (rather than one shared ~/.adept that each request wiped) is what
