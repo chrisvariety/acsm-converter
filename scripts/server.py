@@ -269,29 +269,55 @@ def _extract_user_id(acsm_bytes):
     return match.group(1).strip().decode("ascii", "ignore") if match else None
 
 
+# OverDrive transaction IDs embed the patron:
+#   examplelib~123-4567890-00012_0f8e1c2a-...-410
+#   └─retailer + patron──┘ └loan┘ └title GUID┘ └format
+# Every loan from one patron at one library shares the part before the loan
+# number. OverDrive rate-limits *new* retailer+customer+Adobe-user combinations
+# per patron per hour (E_ADEPT_DATABASE "... is rate limited, and exceeded its
+# hourly limit"), and trips after roughly 8 -- so minting a fresh anonymous
+# device per loan locks out anyone converting a stack of loans at once.
+_OVERDRIVE_PATRON_RE = re.compile(r"^([^~\s]+~\d+-\d+)-\d+_")
+
+
 def _cache_key(acsm_bytes):
-    """Stable per-fulfillment credential cache key, with the reason for logs.
+    """Stable credential cache key, with the reason for logs.
+
+    Returns (key, kind, legacy_key). legacy_key, when set, is an older key the
+    same fulfillment may already be cached under; check it before `key`.
 
     Priority:
       1. <userId>      Adobe-account files (e.g. Google Play). Kept bare so it
                        still matches seeded rows and groups a user's loans onto
                        one device (respecting providers' per-user device limits).
-      2. <transaction> Fulfillment tokens that carry no userId (e.g. OverDrive).
-                       Stable within a given ACSM and unique per fulfillment, so
-                       a retry reuses the device that already holds the loan
-                       instead of minting a new one (which the provider rejects
-                       with E_LIC_ALREADY_FULFILLED_BY_ANOTHER_USER).
-      3. sha256(acsm)  Last resort when neither tag is present — still stable
+      2. OverDrive     <transaction> in OverDrive's library~NNN-patron-loan_...
+         patron        shape. Groups a patron's loans onto one device, the way
+                       a single Adobe Digital Editions install would, so we don't
+                       trip OverDrive's new-user rate limit (see
+                       _OVERDRIVE_PATRON_RE). legacy_key is the per-loan txn key
+                       these were cached under before: a loan already fulfilled
+                       to that device must keep using it, or OverDrive rejects
+                       the retry with E_LIC_ALREADY_FULFILLED_BY_ANOTHER_USER.
+      3. <transaction> Other fulfillment tokens that carry no userId. Stable
+                       within a given ACSM and unique per fulfillment, so a retry
+                       reuses the device that already holds the loan instead of
+                       minting a new one (which the provider rejects with
+                       E_LIC_ALREADY_FULFILLED_BY_ANOTHER_USER).
+      4. sha256(acsm)  Last resort when neither tag is present — still stable
                        per file, so retries stay idempotent without pinning
                        everything to one shared device.
     """
     user_id = _extract_user_id(acsm_bytes)
     if user_id:
-        return user_id, "userId"
+        return user_id, "userId", None
     match = re.search(rb"<transaction>([^<]+)</transaction>", acsm_bytes)
     if match:
-        return "txn:" + match.group(1).strip().decode("ascii", "ignore"), "transaction"
-    return "acsm:" + hashlib.sha256(acsm_bytes).hexdigest(), "sha256"
+        txn = match.group(1).strip().decode("ascii", "ignore")
+        patron = _OVERDRIVE_PATRON_RE.match(txn)
+        if patron:
+            return "overdrive:" + patron.group(1), "OverDrive patron", "txn:" + txn
+        return "txn:" + txn, "transaction", None
+    return "acsm:" + hashlib.sha256(acsm_bytes).hexdigest(), "sha256", None
 
 
 def _caching_enabled():
@@ -1346,11 +1372,11 @@ class ConvertHandler(BaseHTTPRequestHandler):
             with open(acsm_path, "wb") as f:
                 f.write(body)
 
-            cache_key, key_kind = _cache_key(body)
+            cache_key, key_kind, legacy_key = _cache_key(body)
 
             with _download_gate.hold(
                     on_wait=self._queue_notice("download", abort_on_drain=True)):
-                self._prepare_credentials(cache_key, key_kind, adept_dir)
+                self._prepare_credentials(cache_key, key_kind, adept_dir, legacy_key)
 
                 self._send_event({"type": "status", "stage": "download",
                                   "message": "Downloading encrypted file"})
@@ -1755,7 +1781,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
             })
         return notice
 
-    def _prepare_credentials(self, cache_key, key_kind, adept_dir):
+    def _prepare_credentials(self, cache_key, key_kind, adept_dir, legacy_key=None):
         """Populate `adept_dir` from the cache, activating a device on a miss.
 
         Credentials are cached per Adobe userId so we don't re-activate a fresh
@@ -1768,13 +1794,23 @@ class ConvertHandler(BaseHTTPRequestHandler):
         on download slots while the first one activates, but it is bounded by
         ACTIVATE_TIMEOUT and clears itself -- everyone after the first hits the
         cache.
+
+        `legacy_key` (see _cache_key) is only ever read, never written, so it
+        needs no lock: nothing new is cached under it any more.
         """
         print(f"[convert] cache_key={cache_key!r} (from {key_kind}) "
               f"caching={_caching_enabled()}", flush=True)
         with _credential_lock(cache_key):
-            cached = load_cached_creds(cache_key)
+            hit_key = cache_key
+            cached = None
+            if legacy_key:
+                cached = load_cached_creds(legacy_key)
+                hit_key = legacy_key
+            if not cached:
+                cached = load_cached_creds(cache_key)
+                hit_key = cache_key
             if cached:
-                print(f"[convert] credential cache HIT for {cache_key}", flush=True)
+                print(f"[convert] credential cache HIT for {hit_key}", flush=True)
                 self._send_event({"type": "status", "stage": "hydrate",
                                   "message": "Loading cached credentials"})
                 os.makedirs(adept_dir, exist_ok=True)
