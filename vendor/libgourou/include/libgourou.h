@@ -100,6 +100,17 @@ namespace gourou
         ITEM_TYPE addRightsToFile(FulfillmentItem* item, const std::string& path, const std::string& contentType="");
 
         /**
+         * @brief Decrypt the key a fulfilled book is encrypted with, without
+         * the book itself. The same key removeDRM() derives from the rights
+         * addRightsToFile() embeds, so a book can be decrypted somewhere this
+         * device's private key must not go. (local patch, not upstream)
+         *
+         * @param item            Item from fulfill() or rebuilt from getFulfillmentXML()
+         * @param keyOut          16 bytes
+         */
+        void getBookKey(FulfillmentItem* item, unsigned char* keyOut);
+
+        /**
          * @brief SignIn into ACS Server (required to activate device)
          *
          * @param adobeID         AdobeID username

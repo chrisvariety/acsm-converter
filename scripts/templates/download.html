@@ -62,6 +62,8 @@
   <script src="{{ static_url('convert.js') }}"></script>
   <script>
     const TOKEN = {{ token|tojson }};
+    // null when the server has no in-browser PDF decryptor to offer.
+    const PDF_ASSETS = {{ pdf_assets|tojson }};
     const steps = document.getElementById("steps");
     const status = document.getElementById("status");
     const zone = document.getElementById("drop-zone");
@@ -88,6 +90,14 @@
       pickError.hidden = true;
       busy = true;
       zone.classList.add("busy");
+      // A PDF is decrypted right here when the browser can do it; anything
+      // else, and any PDF that fails, is uploaded as before.
+      if (await decryptPdfInBrowser(file, TOKEN, PDF_ASSETS, status)) {
+        busy = false;
+        zone.classList.remove("busy");
+        steps.hidden = true;
+        return;
+      }
       const outcome = await runConversion("/finish?token=" + encodeURIComponent(TOKEN), file, {
         status: status,
         onManualDownload: () => {}, // /finish never sends one

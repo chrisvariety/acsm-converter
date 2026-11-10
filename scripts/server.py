@@ -49,7 +49,10 @@ TEMPLATES = jinja2.Environment(
     lstrip_blocks=True,
 )
 _STATIC_TYPES = {".css": "text/css; charset=utf-8",
-                 ".js": "text/javascript; charset=utf-8"}
+                 ".js": "text/javascript; charset=utf-8",
+                 # pdf_decrypt.wasm, built by the Dockerfile's wasm stage. The
+                 # type matters: browsers refuse to stream-compile anything else.
+                 ".wasm": "application/wasm"}
 STATIC_FILES = {}  # "/static/<name>" -> (bytes, content type); nothing else is served
 for _name in sorted(os.listdir(os.path.join(_HERE, "static"))):
     _type = _STATIC_TYPES.get(os.path.splitext(_name)[1])
@@ -1164,9 +1167,17 @@ class ConvertHandler(BaseHTTPRequestHandler):
         if not download_url:
             self._page(410, "expired.html", ttl_hours=PENDING_TTL_HOURS)
             return
+        # Only when the image was built with its wasm stage; a bare checkout
+        # has no pdf_decrypt.* and the page then always uploads.
+        names = {"worker": "pdf-worker.js", "module": "pdf_decrypt.js",
+                 "wasm": "pdf_decrypt.wasm"}
+        pdf_assets = None
+        if all("/static/" + name in STATIC_FILES for name in names.values()):
+            pdf_assets = {kind: _static_url(name) for kind, name in names.items()}
         self._page(
             200, "download.html",
             token=token,
+            pdf_assets=pdf_assets,
             download_url=download_url,
             provider=_provider_name(download_url),
             is_pdf=urlsplit(download_url).path.lower().endswith(".pdf"),
@@ -1194,6 +1205,9 @@ class ConvertHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path, _, query = self.path.partition("?")
+        if path in ("/finish/key", "/finish/done"):
+            self._finish_in_browser(path, query)
+            return
         if path not in ("/convert", "/finish"):
             self.send_response(404)
             self.end_headers()
@@ -1372,6 +1386,102 @@ class ConvertHandler(BaseHTTPRequestHandler):
             traceback.print_exc()
             log_error("[convert]", "server", "exception", False)
             self._safe_terminal_error("Unexpected error during conversion")
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    def _finish_in_browser(self, path, query):
+        """POST /finish/key and /finish/done: the two calls around a PDF the
+        user's browser decrypts itself (static/pdf-worker.js), instead of
+        uploading it to POST /finish.
+
+        Plain JSON, not the NDJSON stream: both answer at once. Any failure
+        here just sends the page down the upload path, so errors stay terse.
+        """
+        try:
+            self._discard_body(max(0, int(self.headers.get("Content-Length", 0))))
+        except ValueError:
+            pass
+        params = parse_qs(query)
+        token = params.get("token", [None])[0]
+        pending = load_pending_fulfillment(token)
+        if not pending:
+            self._json_response(410, {"error": "expired"})
+            return
+
+        if path == "/finish/key":
+            book = self._book_key(pending)
+            if not book:
+                self._json_response(500, {"error": "key"})
+                return
+            key, name = book
+            print("[finish] book key issued for in-browser decryption", flush=True)
+            # no-store: this is the one secret the whole exchange turns on.
+            self._send_body(200, json.dumps({
+                "key": key,
+                "filename": _download_name(name + ".pdf"),
+            }).encode(), "application/json", "no-store")
+            return
+
+        # /finish/done. `error` set: the browser gave up and is about to upload
+        # the file instead, so the token stays. Otherwise the book was saved.
+        error = params.get("error", [None])[0]
+        if error:
+            # Not log_error: the upload that follows usually succeeds, and
+            # `[error]` lines are what error-rate alerts count.
+            code = re.sub(r"[^a-z0-9_]", "", error.lower())[:40] or "unknown"
+            print(f"[finish] in-browser decryption failed code={code}; "
+                  "the page falls back to uploading", flush=True)
+        else:
+            try:
+                size = max(0, int(params.get("size", ["0"])[0]))
+            except ValueError:
+                size = 0
+            print(f"[finish] Success! Decrypted in the browser ({size} bytes)", flush=True)
+            delete_pending_fulfillment(token)
+            record_conversion("book.pdf", size, manual=True)
+        self._json_response(200, {"ok": True})
+
+    @staticmethod
+    def _book_key(pending):
+        """(key as hex, book name) for a pending fulfillment, or None.
+
+        Asked of acsmdownloader rather than computed here: unwrapping the key
+        takes the device's private key and, for hardened licenses, libgourou's
+        first pass. Not run through `_run`, which logs stdout -- the key.
+        """
+        fulfillment_xml, creds = pending
+        work_dir = tempfile.mkdtemp(dir=WORK_DIR)
+        try:
+            adept_dir = os.path.join(work_dir, "adept")
+            os.makedirs(adept_dir)
+            for name, data in creds.items():
+                with open(os.path.join(adept_dir, name), "wb") as f:
+                    f.write(data)
+            os.makedirs(os.path.join(work_dir, "meta"))
+            with open(_fulfillment_path(work_dir), "wb") as f:
+                f.write(fulfillment_xml)
+            result = subprocess.run(
+                ["acsmdownloader", "--adept-directory", adept_dir,
+                 "--fulfillment", _fulfillment_path(work_dir), "--book-key"],
+                cwd=work_dir, capture_output=True, text=True, timeout=30,
+            )
+            key = re.search(r"^Book key ([0-9a-f]{32})$", result.stdout, re.M)
+            # Verbatim, like the `Created` line in _deliver: a title can
+            # begin or end with spaces.
+            name = re.search(r"^Book name (.*)$", result.stdout, re.M)
+            if result.returncode != 0 or not key:
+                # stdout holds no key on this path; what it has is the reason.
+                print(f"[finish] --book-key failed rc={result.returncode}: "
+                      f"{result.stdout.strip()[-300:]} {result.stderr.strip()[-300:]}",
+                      flush=True)
+                log_error("[finish]", "acsmdownloader", "book_key_failed", False,
+                          result.returncode)
+                return None
+            return key.group(1), (name.group(1) if name else "") or "output"
+        except Exception as e:
+            print(f"[finish] --book-key error: {e}", flush=True)
+            log_error("[finish]", "acsmdownloader", "book_key_exception", False)
+            return None
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 

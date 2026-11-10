@@ -23,6 +23,16 @@ RUN cd /usr/src/libgourou/lib/updfparser \
   && cd /usr/src/libgourou \
   && make BUILD_STATIC=1 STATIC_UTILS=1
 
+# The browser-side PDF decryptor: the same vendor/libgourou/src/pdf_ebx.cpp the
+# server binaries are built from above, compiled to WebAssembly on top of
+# uPDFParser alone. See wasm/pdf_decrypt.cpp.
+FROM emscripten/emsdk:7.0.0 AS wasm
+
+WORKDIR /usr/src
+COPY vendor/libgourou vendor/libgourou
+COPY wasm wasm
+RUN sh wasm/build.sh /out
+
 FROM ubuntu:jammy
 
 COPY --from=builder /usr/src/libgourou/utils/acsmdownloader \
@@ -48,6 +58,7 @@ RUN apt-get update && \
 COPY scripts/server.py /home/libgourou/
 COPY scripts/templates /home/libgourou/templates
 COPY scripts/static /home/libgourou/static
+COPY --from=wasm /out/pdf_decrypt.js /out/pdf_decrypt.wasm /home/libgourou/static/
 WORKDIR /home/libgourou
 
 EXPOSE 8080

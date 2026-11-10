@@ -33,6 +33,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <cstring>
+#include <cstdio>
 #include <algorithm>
 
 #include <libgourou.h>
@@ -56,8 +57,9 @@ static       bool  notify         = true;
 static const char* saveFulfillment = 0;  // write the fulfill reply here
 static const char* fromFile        = 0;  // already-downloaded encrypted book
 static const char* fulfillmentFile = 0;  // fulfill reply saved by an earlier run
+static       bool  bookKey         = false;  // print the book key of fulfillmentFile
 
-enum { OPT_SAVE_FULFILLMENT = 1000, OPT_FROM_FILE, OPT_FULFILLMENT };
+enum { OPT_SAVE_FULFILLMENT = 1000, OPT_FROM_FILE, OPT_FULFILLMENT, OPT_BOOK_KEY };
 
 
 class ACSMDownloader
@@ -90,6 +92,33 @@ public:
                 processor.exportPrivateLicenseKey(filename);
 
                 std::cout << "Private license key exported to " << filename << std::endl;
+            }
+            else if (bookKey)
+            {
+                // For a book that is decrypted elsewhere (in the user's
+                // browser): everything --from-file would have used, minus the
+                // book. The name is the one --from-file would give the file,
+                // before its extension.
+                pugi::xml_document fulfillDoc;
+                if (!fulfillDoc.load_file(fulfillmentFile))
+                    throw std::runtime_error(std::string("Invalid fulfillment file ") + fulfillmentFile);
+                gourou::FulfillmentItem item(fulfillDoc, user);
+
+                unsigned char key[16];
+                processor.getBookKey(&item, key);
+
+                std::string name = item.getMetadata("title");
+                if (name == "")
+                    name = "output";
+                else
+                    std::replace(name.begin(), name.end(), '/', '_');
+
+                char hex[sizeof(key)*2+1];
+                for (unsigned i=0; i<sizeof(key); i++)
+                    snprintf(&hex[i*2], 3, "%02x", key[i]);
+
+                std::cout << "Book key " << hex << std::endl;
+                std::cout << "Book name " << name << std::endl;
             }
             else
             {
@@ -240,7 +269,8 @@ static void usage(const char* cmd)
     std::cout << "  " << "-N|--no-notify"       << "\t\t" << "Don't notify server, even if requested" << std::endl;
     std::cout << "  " << "--save-fulfillment"   << "\t"   << "Write the fulfill reply to this file before downloading" << std::endl;
     std::cout << "  " << "--from-file"          << "\t\t" << "Skip fulfill+download; finish this already-downloaded file (needs --fulfillment, no ACSM)" << std::endl;
-    std::cout << "  " << "--fulfillment"        << "\t\t" << "Fulfill reply saved by --save-fulfillment, used with --from-file" << std::endl;
+    std::cout << "  " << "--fulfillment"        << "\t\t" << "Fulfill reply saved by --save-fulfillment, used with --from-file or --book-key" << std::endl;
+    std::cout << "  " << "--book-key"           << "\t\t" << "Print the key and name of the book --fulfillment describes; no ACSM, no download" << std::endl;
     std::cout << "  " << "-v|--verbose"         << "\t\t" << "Increase verbosity, can be set multiple times" << std::endl;
     std::cout << "  " << "-V|--version"         << "\t\t" << "Display libgourou version" << std::endl;
     std::cout << "  " << "-h|--help"            << "\t\t" << "This help" << std::endl;
@@ -290,6 +320,7 @@ int main(int argc, char** argv)
             {"save-fulfillment", required_argument, 0,  OPT_SAVE_FULFILLMENT },
             {"from-file",        required_argument, 0,  OPT_FROM_FILE },
             {"fulfillment",      required_argument, 0,  OPT_FULFILLMENT },
+            {"book-key",         no_argument,       0,  OPT_BOOK_KEY },
             {0,                  0,                 0,  0 }
         };
 
@@ -352,6 +383,9 @@ int main(int argc, char** argv)
         case OPT_FULFILLMENT:
             fulfillmentFile = optarg;
             break;
+        case OPT_BOOK_KEY:
+            bookKey = true;
+            break;
         default:
             usage(argv[0]);
             return -1;
@@ -363,8 +397,15 @@ int main(int argc, char** argv)
     if (optind == argc-1)
         acsmFile = argv[optind];
 
-    if ((!acsmFile && !exportPrivateKey && !fromFile) || (outputDir && !outputDir[0]) ||
+    if ((!acsmFile && !exportPrivateKey && !fromFile && !bookKey) || (outputDir && !outputDir[0]) ||
         (outputFile && !outputFile[0]))
+    {
+        usage(argv[0]);
+        return -1;
+    }
+
+    // So does --book-key, which needs nothing but the fulfill reply.
+    if (bookKey && (!fulfillmentFile || acsmFile || exportPrivateKey || saveFulfillment || fromFile))
     {
         usage(argv[0]);
         return -1;
@@ -409,6 +450,15 @@ int main(int argc, char** argv)
         {
             usage(argv[0]);
             return -1;
+        }
+    }
+    else if (bookKey)
+    {
+        if (!pathExists(fulfillmentFile))
+        {
+            std::cout << "Error : " << fulfillmentFile << " doesn't exists" << std::endl;
+            ret = -1;
+            goto end;
         }
     }
     else if (fromFile)

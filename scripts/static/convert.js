@@ -107,6 +107,77 @@ async function runConversion(url, body, opts) {
   }
 }
 
+// decryptPdfInBrowser(file, token, assets, status) -> Promise<bool>
+//
+// The /finish flow without the upload, for PDFs: the server hands over the key
+// to this one book (/finish/key) and a worker removes the DRM from the file
+// right here (pdf-worker.js, running the same libgourou code as the server,
+// compiled to WebAssembly). Books can be hundreds of MB, which is slow to
+// upload and more than the server wants to hold.
+//
+// Resolves true once the book has been saved. Resolves false on *any*
+// failure -- not a PDF, no WebAssembly, no key, out of memory, a file the
+// parser rejects -- having changed nothing, so the caller uploads the file to
+// /finish exactly as before and the server gives its own verdict. This path
+// is only ever a shortcut.
+//
+//   assets   {worker, module, wasm}: URLs of pdf-worker.js, pdf_decrypt.js
+//            and pdf_decrypt.wasm
+async function decryptPdfInBrowser(file, token, assets, status) {
+  const base = "/finish/";
+  const query = "?token=" + encodeURIComponent(token);
+  let stage = "unsupported";
+  try {
+    if (!assets || typeof Worker === "undefined" || typeof WebAssembly === "undefined") return false;
+    const magic = new Uint8Array(await file.slice(0, 5).arrayBuffer());
+    if (new TextDecoder().decode(magic) !== "%PDF-") return false;
+
+    setStatus(status, "Checking your file...");
+    stage = "key";
+    const resp = await fetch(base + "key" + query, { method: "POST" });
+    if (!resp.ok) return false;   // expired tokens included: /finish says so properly
+    const book = await resp.json();
+
+    setStatus(status, "Finalizing on your device...");
+    stage = "worker";
+    const pdf = await runPdfWorker(file, book.key, assets);
+
+    saveBook([pdf], { content_type: "application/pdf", filename: book.filename });
+    setStatus(status, "Done! Your file is downloading.");
+    status.className = "done";
+    showDonate(status);
+    // Best-effort: the book is already saved.
+    fetch(base + "done" + query + "&size=" + pdf.byteLength, { method: "POST" }).catch(() => {});
+    return true;
+  } catch (err) {
+    const code = stage + "_" + String((err && err.code) || "exception");
+    fetch(base + "done" + query + "&error=" + encodeURIComponent(code), { method: "POST" }).catch(() => {});
+    return false;
+  }
+}
+
+// Runs one book through pdf-worker.js; resolves with the decrypted PDF as a
+// Uint8Array, rejects with an Error carrying a short `code`.
+function runPdfWorker(file, key, assets) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(assets.worker);
+    const fail = (code) => {
+      worker.terminate();
+      const err = new Error("pdf worker: " + code);
+      err.code = code;
+      reject(err);
+    };
+    worker.onmessage = (e) => {
+      if (!e.data.ok) return fail(e.data.code);
+      worker.terminate();
+      resolve(e.data.pdf);
+    };
+    // A wasm abort (out of memory, most likely) or a script that won't load.
+    worker.onerror = (e) => { e.preventDefault(); fail("crash"); };
+    worker.postMessage({ file: file, key: key, module: assets.module, wasm: assets.wasm });
+  });
+}
+
 function saveBook(parts, resultEvent) {
   const blob = new Blob(parts, { type: resultEvent.content_type });
   // Drop our references now the Blob owns the data; large blobs are backed by

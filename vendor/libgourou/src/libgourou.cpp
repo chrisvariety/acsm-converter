@@ -24,6 +24,7 @@
 #include <ctime>
 
 #include <uPDFParser.h>
+#include <pdf_ebx.h>
 
 #include <libgourou.h>
 #include <libgourou_common.h>
@@ -1330,11 +1331,39 @@ namespace gourou
         }
     }
 
+    /* EBX_HANDLER primitives for pdf_ebx.cpp, served by the DRM client */
+    class ClientEBXCrypto : public EBXCrypto
+    {
+    public:
+        ClientEBXCrypto(DRMProcessorClient* client): client(client) {}
+
+        virtual void md5(const unsigned char* data, unsigned int length,
+                         unsigned char* digestOut)
+        {
+            client->digest("md5", (unsigned char*)data, length, digestOut);
+        }
+
+        virtual void rc4(const unsigned char* key, unsigned int keyLength,
+                         const unsigned char* dataIn, unsigned int length,
+                         unsigned char* dataOut)
+        {
+            unsigned int dataOutLength;
+
+            client->decrypt(CryptoInterface::ALGO_RC4, CryptoInterface::CHAIN_ECB,
+                            key, keyLength, /* Key */
+                            NULL, 0, /* IV */
+                            dataIn, length,
+                            dataOut, &dataOutLength);
+        }
+
+    private:
+        DRMProcessorClient* client;
+    };
+
     void DRMProcessor::removePDFDRM(const std::string& filenameIn, const std::string& filenameOut,
                                     const unsigned char* encryptionKey, unsigned encryptionKeySize)
     {
         uPDFParser::Parser parser;
-        bool EBXHandlerFound = false;
 
         if (filenameIn == filenameOut)
         {
@@ -1352,217 +1381,63 @@ namespace gourou
             return;
         }
 
-        uPDFParser::Integer* ebxVersion;
-        std::vector<uPDFParser::Object*> objects = parser.objects();
-        std::vector<uPDFParser::Object*>::iterator it, ebxIt;
-        std::vector<uPDFParser::Object*>::reverse_iterator rIt;
-        std::vector<uPDFParser::Object*> ebxObjects;
         unsigned char decryptedKey[16];
-        int ebxId;
 
-        for(rIt = objects.rbegin(); rIt != objects.rend(); rIt++)
-        {
-            // Update EBX_HANDLER with rights
-            if ((*rIt)->hasKey("Filter") && (**rIt)["Filter"]->str() == "/EBX_HANDLER")
-            {
-                EBXHandlerFound = true;
-                uPDFParser::Object* ebx = *rIt;
+        // Update EBX_HANDLER with rights
+        uPDFParser::Object* ebx = findEBXHandler(parser);
 
-                ebxVersion  = (uPDFParser::Integer*)(*ebx)["V"];
-                if (ebxVersion->value() != 4)
-                {
-                    EXCEPTION(DRM_VERSION_NOT_SUPPORTED, "EBX encryption version not supported " << ebxVersion->value());
-                }
-
-                if (!(ebx->hasKey("ADEPT_LICENSE")))
-                {
-                    EXCEPTION(DRM_ERR_ENCRYPTION_KEY, "No ADEPT_LICENSE found");
-                }
-
-                uPDFParser::String* licenseObject = (uPDFParser::String*)(*ebx)["ADEPT_LICENSE"];
-
-                std::string value = licenseObject->value();
-                // Pad with '='
-                while ((value.size() % 4))
-                    value += "=";
-                ByteArray zippedData = ByteArray::fromBase64(value);
-
-                if (zippedData.size() == 0)
-                    EXCEPTION(DRM_ERR_ENCRYPTION_KEY, "Invalid ADEPT_LICENSE");
-
-                ByteArray rightsStr;
-                client->inflate(zippedData, rightsStr);
-
-                pugi::xml_document rightsDoc;
-                rightsDoc.load_string((const char*)rightsStr.data());
-
-                decryptADEPTKey(rightsDoc, decryptedKey, encryptionKey, encryptionKeySize);
-
-                ebxId = ebx->objectId();
-
-                break;
-            }
-        }
-
-        if (!EBXHandlerFound)
+        if (!ebx)
         {
             EXCEPTION(DRM_ERR_ENCRYPTION_KEY, "EBX_HANDLER not found");
         }
 
-        for(it = objects.begin(); it != objects.end(); it++)
+        uPDFParser::Integer* ebxVersion = (uPDFParser::Integer*)(*ebx)["V"];
+        if (ebxVersion->value() != 4)
         {
-            uPDFParser::Object* object = *it;
-
-            if (object->objectId() == ebxId)
-            {
-                ebxObjects.push_back(object);
-                continue;
-            }
-
-            // Should not decrypt XRef stream
-            if (object->hasKey("Type") && (*object)["Type"]->str() == "/XRef")
-            {
-                GOUROU_LOG(DEBUG, "XRef stream at " << object->offset());
-                continue;
-            }
-
-            GOUROU_LOG(DEBUG, "Obj " << object->objectId());
-
-            unsigned char tmpKey[sizeof(decryptedKey)];
-
-            generatePDFObjectKey(ebxVersion->value(),
-                                 decryptedKey, sizeof(decryptedKey),
-                                 object->objectId(), object->generationNumber(),
-                                 tmpKey);
-
-            uPDFParser::Dictionary& dictionary = object->dictionary();
-            std::map<std::string, uPDFParser::DataType*>& dictValues = dictionary.value();
-            std::map<std::string, uPDFParser::DataType*>::iterator dictIt;
-            std::map<std::string, uPDFParser::DataType*> decodedStrings;
-            std::string string;
-
-            /* Parse dictionary */
-            for (dictIt = dictValues.begin(); dictIt != dictValues.end(); dictIt++)
-            {
-                uPDFParser::DataType* dictData = dictIt->second;
-                if (dictData->type() == uPDFParser::DataType::STRING)
-                {
-                    string = ((uPDFParser::String*) dictData)->unescapedValue();
-
-                    unsigned char* encryptedData = (unsigned char*)string.c_str();
-                    unsigned int dataLength = string.size();
-                    unsigned char* clearData = new unsigned char[dataLength];
-                    unsigned int dataOutLength;
-
-                    GOUROU_LOG(DEBUG, "Decrypt string " << dictIt->first << " " << dataLength);
-
-                    client->decrypt(CryptoInterface::ALGO_RC4, CryptoInterface::CHAIN_ECB,
-                                    tmpKey, sizeof(tmpKey), /* Key */
-                                    NULL, 0, /* IV */
-                                    encryptedData, dataLength,
-                                    clearData, &dataOutLength);
-
-                    decodedStrings[dictIt->first] = new uPDFParser::String(
-                        std::string((const char*)clearData, dataOutLength));
-
-                    delete[] clearData;
-                }
-                else if (dictData->type() == uPDFParser::DataType::HEXASTRING)
-                {
-                    string = ((uPDFParser::HexaString*) dictData)->value();
-                    ByteArray hexStr = ByteArray::fromHex(string);
-
-                    unsigned char* encryptedData = hexStr.data();
-                    unsigned int dataLength = hexStr.size();
-                    unsigned char* clearData = new unsigned char[dataLength];
-                    unsigned int dataOutLength;
-
-                    GOUROU_LOG(DEBUG, "Decrypt hexa string " << dictIt->first << " " << dataLength);
-
-                    client->decrypt(CryptoInterface::ALGO_RC4, CryptoInterface::CHAIN_ECB,
-                                    tmpKey, sizeof(tmpKey), /* Key */
-                                    NULL, 0, /* IV */
-                                    encryptedData, dataLength,
-                                    clearData, &dataOutLength);
-
-                    ByteArray clearHexStr = ByteArray(clearData, dataOutLength);
-                    decodedStrings[dictIt->first] = new uPDFParser::HexaString(
-                        clearHexStr.toHex());
-
-                    delete[] clearData;
-                }
-            }
-
-            for (dictIt = decodedStrings.begin(); dictIt != decodedStrings.end(); dictIt++)
-                dictionary.replace(dictIt->first, dictIt->second);
-
-            std::vector<uPDFParser::DataType*>::iterator datasIt;
-            std::vector<uPDFParser::DataType*>& datas = object->data();
-            uPDFParser::Stream* stream;
-
-            for (datasIt = datas.begin(); datasIt != datas.end(); datasIt++)
-            {
-                if ((*datasIt)->type() != uPDFParser::DataType::STREAM)
-                    continue;
-
-                stream = (uPDFParser::Stream*) (*datasIt);
-                unsigned char* encryptedData = stream->data();
-                unsigned int dataLength = stream->dataLength();
-                unsigned char* clearData = new unsigned char[dataLength];
-                unsigned int dataOutLength;
-
-                GOUROU_LOG(DEBUG, "Decrypt stream id " << object->objectId() << ", size " << stream->dataLength());
-
-                client->decrypt(CryptoInterface::ALGO_RC4, CryptoInterface::CHAIN_ECB,
-                                tmpKey, sizeof(tmpKey), /* Key */
-                                NULL, 0, /* IV */
-                                encryptedData, dataLength,
-                                clearData, &dataOutLength);
-
-                stream->setData(clearData, dataOutLength, true);
-                if (dataOutLength != dataLength)
-                    GOUROU_LOG(DEBUG, "New size " << dataOutLength);
-            }
+            EXCEPTION(DRM_VERSION_NOT_SUPPORTED, "EBX encryption version not supported " << ebxVersion->value());
         }
 
-        /* Delete objects that reference EBX objects,
-           except in trailer and objects that references Info */
-        for(it = objects.begin(); it != objects.end(); it++)
+        if (!(ebx->hasKey("ADEPT_LICENSE")))
         {
-            uPDFParser::Object* object = *it;
-
-            if (object->hasKey("Encrypt") && (*object)["Encrypt"]->type() == uPDFParser::DataType::REFERENCE)
-            {
-                uPDFParser::Reference* encrypt = (uPDFParser::Reference*)(*object)["Encrypt"];
-                
-                if (object->hasKey("Info"))
-                {
-                    object->deleteKey("Encrypt");
-                    continue;
-                }
-                
-                /* Delete EBX objects */
-                for(ebxIt = ebxObjects.begin(); ebxIt != ebxObjects.end(); ebxIt++)
-                {
-                    if (encrypt->value() == (*ebxIt)->objectId())
-                    {
-                        GOUROU_LOG(DEBUG, "Delete stream id " << object->objectId());
-                        
-                        parser.removeObject(object);
-                        break;
-                    }
-                }
-            }
+            EXCEPTION(DRM_ERR_ENCRYPTION_KEY, "No ADEPT_LICENSE found");
         }
-        
-        /* Delete EBX objects */
-        for(it = ebxObjects.begin(); it != ebxObjects.end(); it++)
-            parser.removeObject(*it);
 
-        uPDFParser::Object& trailer = parser.getTrailer();
-        trailer.deleteKey("Encrypt");
+        uPDFParser::String* licenseObject = (uPDFParser::String*)(*ebx)["ADEPT_LICENSE"];
+
+        std::string value = licenseObject->value();
+        // Pad with '='
+        while ((value.size() % 4))
+            value += "=";
+        ByteArray zippedData = ByteArray::fromBase64(value);
+
+        if (zippedData.size() == 0)
+            EXCEPTION(DRM_ERR_ENCRYPTION_KEY, "Invalid ADEPT_LICENSE");
+
+        ByteArray rightsStr;
+        client->inflate(zippedData, rightsStr);
+
+        pugi::xml_document rightsDoc;
+        rightsDoc.load_string((const char*)rightsStr.data());
+
+        decryptADEPTKey(rightsDoc, decryptedKey, encryptionKey, encryptionKeySize);
+
+        /* The decryption itself lives in pdf_ebx.cpp, shared with the
+           WebAssembly build that runs it in the browser. */
+        ClientEBXCrypto crypto(client);
+        removeEBXEncryption(parser, ebx, decryptedKey, sizeof(decryptedKey), crypto);
 
         parser.write(filenameOut);
+    }
+
+    void DRMProcessor::getBookKey(FulfillmentItem* item, unsigned char* keyOut)
+    {
+        /* What addRightsToFile() embeds in the book and removeDRM() reads
+           back from it: going through decryptADEPTKey() keeps the user check
+           and the hardened-key first pass. */
+        pugi::xml_document rightsDoc;
+        rightsDoc.load_string(item->getRights().c_str());
+
+        decryptADEPTKey(rightsDoc, keyOut);
     }
 
     void DRMProcessor::removeDRM(const std::string& filenameIn, const std::string& filenameOut,

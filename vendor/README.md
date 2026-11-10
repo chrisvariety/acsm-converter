@@ -28,6 +28,33 @@ with these local patches:
     file obtained elsewhere exactly as a download would be finished, including
     the `Created <name>` line and file naming).
 
+- **Book key without the book** (for PDFs decrypted in the user's browser,
+  `POST /finish/key` in `scripts/server.py`): `DRMProcessor::getBookKey()`
+  returns the key of a fulfilled item, through the same `decryptADEPTKey()`
+  that `removeDRM()` uses (user check and hardened-key first pass included).
+  `acsmdownloader --fulfillment <file> --book-key` prints it as
+  `Book key <32 hex digits>`, followed by `Book name <title>`, the name
+  `--from-file` would give the file before its extension. No ACSM, no network.
+
+- **PDF decryption split out and fixed** (`src/pdf_ebx.cpp`, `include/pdf_ebx.h`):
+  the part of `DRMProcessor::removePDFDRM` that runs once the book key is known
+  (decrypt every string and stream, drop the `EBX_HANDLER` dictionary) now lives
+  in its own file that depends on uPDFParser alone, taking MD5 and RC4 through
+  a small `EBXCrypto` interface. `removePDFDRM` calls it with the DRM client
+  behind that interface; `wasm/pdf_decrypt.cpp` at the top of the repository
+  compiles the same file to WebAssembly for the browser. Finding the handler,
+  the version check, reading `ADEPT_LICENSE` and unwrapping the key are
+  unchanged and stay in `libgourou.cpp`. Two fixes came with the move:
+  - Strings are decrypted wherever they are in an object. Upstream only looked
+    at the top level of each object's dictionary, so strings inside arrays and
+    nested dictionaries (`/Dest [...]`, `/A << /D (...) >>`, name trees) and
+    objects that are a bare string or array were written out still encrypted:
+    link and bookmark targets came out as garbage.
+  - Literal strings are fully unescaped before decryption (octal `\ddd`, `\t`,
+    `\b`, `\f`, line continuations), where `String::unescapedValue()` handles
+    `\\ \( \) \n \r` only. Decrypted strings are written back as hexadecimal
+    strings, since `String::str()` escapes parentheses and nothing else.
+
 - `utils/drmprocessorclientimpl.cpp` (`sendRequest`): the `CLIENT_HTTP_ERROR`
   message carries the request URL, i.e. `HTTP Error code 429 <URL>` instead of
   `HTTP Error code 429`. A single acsmdownloader run makes several requests

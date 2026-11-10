@@ -4,5 +4,6 @@
 #include the following
 !scripts
 !vendor
+!wasm
 !LICENSE
 !README.md
