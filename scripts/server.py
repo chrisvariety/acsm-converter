@@ -150,6 +150,12 @@ class _DrainAbort(Exception):
     """Raised to kick a still-queued request off the machine during a drain."""
 
 
+# Browser disconnects: closed tab, sleeping phone, or dropped network.
+# TimeoutError covers socket timeouts; subprocess and psycopg2 timeouts
+# raise different exception types.
+CLIENT_DISCONNECTED = (BrokenPipeError, ConnectionResetError, TimeoutError)
+
+
 class FairGate:
     """FIFO admission gate allowing at most `capacity` concurrent holders.
 
@@ -789,6 +795,35 @@ KNOWN_ERRORS = {
             },
         ],
     },
+    # OverDrive's per-patron hourly limit on new Adobe users, which it reports
+    # as E_ADEPT_DATABASE with the reason URL-encoded in the message ("New
+    # RetailerID+CustomerID+UserID combination is rate limited, and exceeded its
+    # hourly limit"). Keyed on the reason, not the code: a bare E_ADEPT_DATABASE
+    # is a genuine Adobe database error and should still alert. Grouping a
+    # patron's loans onto one device (_OVERDRIVE_PATRON_RE) makes this rare,
+    # but anyone who already hit it still has to wait the hour out.
+    "combination%20is%20rate%20limited": {
+        # Shown to the user and (via _error_token) logged as
+        # E_ADEPT_DATABASE_rate_limited, rather than as the match string.
+        "error_code": "E_ADEPT_DATABASE (rate limited)",
+        "transient": True,
+        "title": "Your library is limiting new devices for now",
+        "description": (
+            "OverDrive (Libby) limits how many new devices one library card "
+            "can send books to each hour, and your card has reached that "
+            "limit. Nothing is wrong with your file or your loan."
+        ),
+        "solutions": [
+            {
+                "heading": "Wait an hour, then try again",
+                "text": (
+                    "Retrying straight away will fail the same way. After about "
+                    "an hour, convert the same ACSM file again. If it has "
+                    "expired by then, download a fresh one from your library."
+                ),
+            },
+        ],
+    },
     # Adobe/provider-side outages. Separate keys because _match_known_error does
     # plain substring matching; they all share one card.
     "HTTP Error code 500": UPSTREAM_UNAVAILABLE,
@@ -1086,6 +1121,9 @@ IGNORED_ERRORS = {
     # Upload isn't parseable XML. Books uploaded by mistake are caught earlier
     # (_sniff_not_acsm); what's left is the odd empty or truncated file.
     "FF_INVALID_ACSM_FILE",
+    # The store's download server has no file at the URL the ACSM points to:
+    # pulled titles, distributor-side breakage, or very stale ACSMs.
+    "HTTP_404",
 }
 
 
@@ -1097,7 +1135,7 @@ def _classify_error(output, returncode):
     """
     code, guidance = _match_known_error(output)
     if guidance:
-        return _error_token(code), True
+        return _error_token(guidance.get("error_code", code)), True
     code = _error_code(output, returncode)
     return code, code in IGNORED_ERRORS
 
@@ -1303,14 +1341,14 @@ class ConvertHandler(BaseHTTPRequestHandler):
 
         try:
             self._send_event({"type": "queued"})
-        except (BrokenPipeError, ConnectionResetError):
+        except CLIENT_DISCONNECTED:
             print("[convert] Client disconnected while queued", flush=True)
             return
 
         try:
             with _active_request():
                 work()
-        except (BrokenPipeError, ConnectionResetError):
+        except CLIENT_DISCONNECTED:
             print(f"[convert] Client disconnected during {self._stage}", flush=True)
         except _DrainAbort:
             # Still queued when the machine started draining. Nothing has been
@@ -1403,7 +1441,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 self._report_process_error(e)
         except subprocess.TimeoutExpired as e:
             self._report_timeout(e, "[convert]")
-        except (BrokenPipeError, ConnectionResetError, _DrainAbort):
+        except (*CLIENT_DISCONNECTED, _DrainAbort):
             raise  # do_POST handles these; nothing to report here
         except Exception:
             # Anything else (e.g. a missing decrypted file) would otherwise
@@ -1568,7 +1606,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 self._send_event({"type": "error", **WRONG_FILE_GUIDANCE})
         except subprocess.TimeoutExpired as e:
             self._report_timeout(e, "[finish]")
-        except (BrokenPipeError, ConnectionResetError, _DrainAbort):
+        except (*CLIENT_DISCONNECTED, _DrainAbort):
             raise  # do_POST handles these; nothing to report here
         except Exception:
             print("[finish] ERROR: Unexpected exception:", flush=True)
@@ -1873,7 +1911,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
                     try:
                         self._send_event({"type": "status", "stage": heartbeat_stage,
                                           "message": f"Still working ({int(elapsed)}s)"})
-                    except (BrokenPipeError, ConnectionResetError):
+                    except CLIENT_DISCONNECTED:
                         # Client/CDN went away — stop wasting work on a dead socket.
                         print(f"[run] {label} client disconnected; killing", flush=True)
                         proc.kill()
