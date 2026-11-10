@@ -138,7 +138,7 @@ async function decryptPdfInBrowser(file, token, assets, status) {
     if (!resp.ok) return false;   // expired tokens included: /finish says so properly
     const book = await resp.json();
 
-    setStatus(status, "Finalizing on your device...");
+    setStatus(status, "Finalizing on your device, this can take a minute...");
     stage = "worker";
     const pdf = await runPdfWorker(file, book.key, assets);
 
