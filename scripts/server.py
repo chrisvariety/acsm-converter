@@ -765,6 +765,63 @@ KNOWN_ERRORS = {
             },
         ],
     },
+    # The provider's Adobe fulfillment server has no book behind the ACSM's
+    # resource ID. Seen mostly from ProQuest (Ebook Central); an immediate retry
+    # of the same file fails the same way, so this is not a "try again" card.
+    "E_URLLINK_NO_SUCH_RESOURCE": {
+        "title": "Your content provider can't find this book",
+        "description": (
+            "Your content provider's server says it has no book file for this "
+            "ACSM file. This is a problem on their side: the book may have "
+            "been withdrawn or not set up correctly. Adobe Digital Editions "
+            "and other ACSM tools will fail on this file the same way."
+        ),
+        "solutions": [
+            {
+                "heading": "Download a fresh ACSM file",
+                "text": (
+                    "Go back to your library or store and download the ACSM "
+                    "file again, then convert the new one."
+                ),
+            },
+            {
+                "heading": "Contact your library or store",
+                "text": (
+                    "If a fresh file fails the same way, let them know the "
+                    "book can't be downloaded (error E_URLLINK_NO_SUCH_RESOURCE). "
+                    "Only they or the publisher can fix it."
+                ),
+            },
+        ],
+    },
+    # The provider's Adobe server couldn't reach its own license backend.
+    # Generally works on retry.
+    "E_LIC_CONNECTION_PROBLEM": {
+        "transient": True,
+        "title": "Your content provider's server had a connection problem",
+        "description": (
+            "Your content provider's DRM server couldn't connect to the system "
+            "that issues the book's license. This is a temporary problem on "
+            "their side, not with your file."
+        ),
+        "solutions": [
+            {
+                "heading": "Wait a minute and try again",
+                "text": (
+                    "Convert the same file again in a minute or two. There's "
+                    "no need to download a new one."
+                ),
+            },
+            {
+                "heading": "If it keeps happening",
+                "text": (
+                    "If it still fails after a few hours, contact your "
+                    "content provider and let them know you're seeing this "
+                    "error."
+                ),
+            },
+        ],
+    },
     # Only shown when the browser-assisted download can't be offered (the 429
     # hit a step other than the book download, or there is no database). The
     # old advice to wait and retry the same file was wrong for the case we see
@@ -860,6 +917,28 @@ KNOWN_ERRORS = {
                 "text": (
                     "If it keeps timing out, download a new ACSM file from your "
                     "content provider and try converting that instead."
+                ),
+            },
+        ],
+    },
+    # libgourou's curl client failing a DNS lookup (also exception code 0x500b).
+    # Our server looking up the provider's host, so a blip on our side or theirs.
+    "Couldn't resolve host name": {
+        # Logged and shown as the libgourou code rather than the match string.
+        "error_code": "CLIENT_NETWORK_ERROR",
+        "transient": True,
+        "title": "Couldn't reach your content provider",
+        "description": (
+            "The converter couldn't look up your content provider's server "
+            "address. This is usually a brief network problem and clears on "
+            "its own."
+        ),
+        "solutions": [
+            {
+                "heading": "Try again in a minute",
+                "text": (
+                    "Convert the same file again. There's no need to "
+                    "download a new one."
                 ),
             },
         ],
