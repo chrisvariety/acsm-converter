@@ -1,0 +1,38 @@
+name: Conversion problem
+description: A book failed to convert, or the converted file doesn't work.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! The two most useful things you can include are the **log** and the **ACSM file**. Without them it's usually impossible to tell what went wrong.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you try, and what did you see? Include the error title shown on the page if there was one.
+      placeholder: I uploaded my ACSM and got "Google Play device limit reached"...
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        Under the error on the converter page, click **Show log**, then copy everything that appears and paste it here.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: acsm
+    attributes:
+      label: ACSM file
+      description: |
+        GitHub won't accept `.acsm` attachments, so rename the file to add `.txt` at the end (e.g. `MyBook.acsm.txt`), then drag it into this box.
+
+        Note: issues are public. An ACSM is tied to your purchase or loan, but most expire within minutes to hours of downloading, so attaching an expired or failed one is generally fine.
+      placeholder: Drag your MyBook.acsm.txt file here
+    validations:
+      required: false

@@ -325,7 +325,7 @@ function showLogControls(status, showSupport, eventLog) {
     const support = document.createElement("p");
     support.className = "support";
     support.innerHTML =
-      'Still stuck? Did you read the error message and try again after a few minutes? <a href="https://github.com/chrisvariety/acsm-converter/issues/new" target="_blank" rel="noopener">Open an issue on GitHub</a> for support, and include the log below along with any info on the book you were trying to convert e.g. where you got it, what kind of book it is (for example, a novel or a textbook or a cookbook), and any other relevant details.';
+      'Still stuck? Did you read the error message and try again after a few minutes? <a href="https://github.com/chrisvariety/acsm-converter/issues/new?template=conversion-problem.yml" target="_blank" rel="noopener">Open an issue on GitHub</a> for support, and include the log below and your ACSM file.';
     controls.appendChild(support);
   }
 
