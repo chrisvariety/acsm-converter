@@ -613,6 +613,31 @@ def _fulfillment_path(work_dir):
     return os.path.join(work_dir, "meta", "fulfillment.xml")
 
 
+def log_download_url(work_dir, result):
+    """One line per book download the provider's Fulfill step approved.
+
+    Format: `[download] result=ok url=https://host/path`, with `result` set to
+    the error code (as in `[error]`) when the download fails. Lets us compare
+    URLs that work with ones that don't (e.g. OverDrive CDN 404s), since
+    libgourou only prints the URL on failure. The query string is dropped: some
+    providers sign it, and the path is enough to spot a pattern. Nothing is
+    logged when Fulfill itself failed, as there's no URL yet.
+    """
+    try:
+        with open(_fulfillment_path(work_dir), "rb") as f:
+            url = _fulfillment_download_url(f.read())
+    except OSError:
+        return
+    if not url:
+        return
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port:
+        host += f":{parts.port}"
+    print(f"[download] result={result} url={parts.scheme}://{host}{parts.path}",
+          flush=True)
+
+
 def _provider_name(url):
     """User-facing store name for a download URL, if we know it."""
     host = (urlsplit(url).hostname or "").lower()
@@ -1541,15 +1566,21 @@ class ConvertHandler(BaseHTTPRequestHandler):
                     timeout=DOWNLOAD_TIMEOUT,
                     heartbeat_stage="download",
                 )
+            log_download_url(work_dir, "ok")
             # Download slot released: whoever is next starts fetching now,
             # rather than waiting on the decrypt below.
             self._deliver(result, work_dir, adept_dir, "[convert]")
 
         except subprocess.CalledProcessError as e:
             self._log_process_error(e, "[convert]")
+            if os.path.basename(e.cmd[0]) == "acsmdownloader":
+                log_download_url(work_dir, _classify_error(
+                    (e.stdout or "") + (e.stderr or ""), e.returncode)[0])
             if not self._offer_browser_download(e, work_dir, adept_dir):
                 self._report_process_error(e)
         except subprocess.TimeoutExpired as e:
+            if os.path.basename(e.cmd[0]) == "acsmdownloader":
+                log_download_url(work_dir, "timeout")
             self._report_timeout(e, "[convert]")
         except (*CLIENT_DISCONNECTED, _DrainAbort):
             raise  # do_POST handles these; nothing to report here
