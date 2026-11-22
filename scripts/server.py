@@ -741,6 +741,37 @@ KNOWN_ERRORS = {
             },
         ],
     },
+    # OverDrive's fulfillment server has no license for the loan behind the
+    # ACSM. Seen when re-converting a weeks-old ACSM for a loan the patron had
+    # already returned; ADE fails the same way. Keyed on the code alone: the
+    # "ACSM file expired" warning that came with it is mostly false alarms
+    # (libgourou ignores the timezone offset) and can't be matched here anyway.
+    "E_ADEPT_LIC_TOKEN_NULL_DATA": {
+        "title": "This loan is no longer available",
+        "description": (
+            "Your library's server no longer has a license for this book. This "
+            "usually means the loan was returned or has ended, or the ACSM file "
+            "is from an older loan."
+        ),
+        "solutions": [
+            {
+                "heading": "Borrow the book again",
+                "text": (
+                    "If you returned the book or the loan ended, borrow it again "
+                    "from your library, download a new ACSM file, and convert "
+                    "that one."
+                ),
+            },
+            {
+                "heading": "Download a fresh ACSM file",
+                "text": (
+                    "If the book is still on loan, download its ACSM file again "
+                    "from your library and convert the new file instead of an "
+                    "old saved copy."
+                ),
+            },
+        ],
+    },
     "E_LIC_LICENSE_SIGN_ERROR": {
         "title": "Provider-side signing error",
         "description": (
