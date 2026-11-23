@@ -1300,16 +1300,28 @@ def _error_code(output, returncode):
     return "unknown"
 
 
-def log_error(tag, command, code, known, returncode=None):
+def log_error(tag, command, code, known, returncode=None, context=""):
     """One structured line per failed conversion, for log-based alerting.
 
-    Format: `[error] flow=convert command=acsmdownloader code=E_FOO known=false rc=1`.
+    Format: `[error] flow=convert command=acsmdownloader code=E_FOO known=false rc=1`,
+    followed by `context` (see `_error_context`) when the ACSM was parsed.
     Only the code, never tool output: stdout can carry the book's title and
     download URL, and this line is meant to be shipped off-box.
     """
     rc = "" if returncode is None else f" rc={returncode}"
     print(f"[error] flow={tag.strip('[]')} command={command} code={code} "
-          f"known={str(known).lower()}{rc}", flush=True)
+          f"known={str(known).lower()}{rc}{context}", flush=True)
+
+
+def _error_context(cache_key):
+    """` key=...` for the `[error]` line.
+
+    A short hash of the credential cache key: stable across retries of the
+    same ACSM (and, for Adobe-account files, across one user's books), so
+    alerts can count distinct people rather than retries. Hashed because the
+    raw key is a transaction ID or Adobe userId.
+    """
+    return f" key={hashlib.sha256(cache_key.encode()).hexdigest()[:12]}"
 
 
 def _download_name(filename):
@@ -1331,6 +1343,12 @@ def _download_name(filename):
 
 
 class ConvertHandler(BaseHTTPRequestHandler):
+    # Appended to this request's `[error]` lines once its ACSM is parsed.
+    _error_ctx = ""
+
+    def _log_error(self, tag, command, code, known, returncode=None):
+        log_error(tag, command, code, known, returncode, self._error_ctx)
+
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/":
@@ -1546,6 +1564,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 f.write(body)
 
             cache_key, key_kind, legacy_key = _cache_key(body)
+            self._error_ctx = _error_context(cache_key)
 
             with _download_gate.hold(
                     on_wait=self._queue_notice("download", abort_on_drain=True)):
@@ -1589,7 +1608,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
             # propagate and close the socket silently — surface it instead.
             print("[convert] ERROR: Unexpected exception during conversion:", flush=True)
             traceback.print_exc()
-            log_error("[convert]", "server", "exception", False)
+            self._log_error("[convert]", "server", "exception", False)
             self._safe_terminal_error("Unexpected error during conversion")
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -1788,7 +1807,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
                 break
 
         if not output_filename:
-            log_error(tag, "acsmdownloader", "no_output_filename", False)
+            self._log_error(tag, "acsmdownloader", "no_output_filename", False)
             self._send_event({
                 "type": "error",
                 "error": "Could not determine output filename",
@@ -1805,7 +1824,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
             # reading the log after the wrong file entirely.
             print(f"{tag} ERROR: parsed {output_filename!r} but no such file "
                   f"in {work_dir}: {os.listdir(work_dir)}", flush=True)
-            log_error(tag, "acsmdownloader", "output_file_missing", False)
+            self._log_error(tag, "acsmdownloader", "output_file_missing", False)
             self._send_event({
                 "type": "error",
                 "error": "Downloaded file not found",
@@ -1841,8 +1860,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
         record_conversion(output_filename, out_size, manual=(tag == "[finish]"))
         return True
 
-    @staticmethod
-    def _log_process_error(e, tag, classified=None):
+    def _log_process_error(self, e, tag, classified=None):
         """Log a failed tool run. `classified` overrides `_classify_error`
         with a (code, known) pair when the caller knows better."""
         label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
@@ -1853,7 +1871,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
         print(f"{tag} stderr: {e.stderr}", flush=True)
         code, known = classified or _classify_error(
             (e.stdout or "") + (e.stderr or ""), e.returncode)
-        log_error(tag, label, code, known, e.returncode)
+        self._log_error(tag, label, code, known, e.returncode)
 
     def _report_process_error(self, e):
         """Send the error card for a failed tool run."""
@@ -1889,7 +1907,7 @@ class ConvertHandler(BaseHTTPRequestHandler):
     def _report_timeout(self, e, tag):
         label = os.path.basename(e.cmd[0]) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
         print(f"{tag} ERROR: {label} timed out after {e.timeout}s", flush=True)
-        log_error(tag, label, "timeout", True)
+        self._log_error(tag, label, "timeout", True)
         guidance = TIMEOUT_GUIDANCE.get(label, TIMEOUT_GUIDANCE["_default"])
         self._safe_terminal_event({
             "type": "error",
