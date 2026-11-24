@@ -50,6 +50,7 @@ TEMPLATES = jinja2.Environment(
 )
 _STATIC_TYPES = {".css": "text/css; charset=utf-8",
                  ".js": "text/javascript; charset=utf-8",
+                 ".txt": "text/plain; charset=utf-8",
                  # pdf_decrypt.wasm, built by the Dockerfile's wasm stage. The
                  # type matters: browsers refuse to stream-compile anything else.
                  ".wasm": "application/wasm"}
@@ -59,6 +60,10 @@ for _name in sorted(os.listdir(os.path.join(_HERE, "static"))):
     if _type:
         with open(os.path.join(_HERE, "static", _name), "rb") as _f:
             STATIC_FILES["/static/" + _name] = (_f.read(), _type)
+# Well-known files crawlers look for at the site root (robots.txt, and
+# llms.txt per https://llmstxt.org).
+for _name in ("robots.txt", "llms.txt"):
+    STATIC_FILES["/" + _name] = STATIC_FILES["/static/" + _name]
 
 
 def _static_url(name):
